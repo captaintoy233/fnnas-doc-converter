@@ -1,0 +1,75 @@
+# DocConverter + WeKnora 全栈部署
+# 适用: 任意 Docker 环境 (非 fnOS 也可用)
+# 使用: docker compose up -d
+
+version: "3.8"
+
+networks:
+  docnet:
+    driver: bridge
+
+services:
+  # ── 格式转换器 ──
+  converter:
+    build: ./app/server
+    image: docconverter:1.0.0
+    container_name: doc-converter
+    ports:
+      - "8080:8080"
+    environment:
+      WEKNORA_URL: "http://weknora-app:18080"
+    volumes:
+      - uploads:/data/uploads
+      - weknora_data:/data/weknora
+    networks:
+      - docnet
+    restart: unless-stopped
+
+  # ── WeKnora 知识库平台 ──
+  weknora-app:
+    image: tencent/weknora-app:latest
+    container_name: weknora-app
+    ports:
+      - "18080:18080"
+    volumes:
+      - weknora_data:/app/data
+    networks:
+      - docnet
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  weknora-docreader:
+    image: tencent/weknora-docreader:latest
+    container_name: weknora-docreader
+    volumes:
+      - ./patches:/opt/weknora-patches:ro
+    entrypoint: ["/opt/weknora-patches/startup.sh"]
+    networks:
+      - docnet
+    restart: unless-stopped
+
+  # ── 基础设施 ──
+  postgres:
+    image: postgres:16-alpine
+    container_name: weknora-pg
+    environment:
+      POSTGRES_DB: weknora
+      POSTGRES_USER: weknora
+      POSTGRES_PASSWORD: weknora123
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    networks:
+      - docnet
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U weknora"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  uploads:
+  weknora_data:
+  pg_data:

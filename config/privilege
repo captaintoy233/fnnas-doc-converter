@@ -1,0 +1,7 @@
+{
+    "defaults": {
+        "run-as": "package"
+    },
+    "username": "doc_converter",
+    "groupname": "doc_converter"
+}
