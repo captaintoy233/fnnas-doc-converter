@@ -1,0 +1,12 @@
+{
+    ".url": {
+        "App.DocConverter.Application": {
+            "title": "文档格式转换器",
+            "icon": "images/icon_{0}.png",
+            "type": "iframe",
+            "protocol": "http",
+            "url": "/cgi/ThirdParty/App.DocConverter/index.cgi/",
+            "allUsers": true
+        }
+    }
+}

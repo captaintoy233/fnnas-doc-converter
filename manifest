@@ -1,0 +1,10 @@
+appname               = App.DocConverter
+version               = 1.0.0
+display_name          = 文档格式转换器
+desc                  = 全面格式文档转 Markdown，自动推送 WeKnora 知识库。<br>支持的格式：OFD、WPS、DOCX、XLSX、ET、PDF(文字型)、HTML、PPTX、PPT、DPS。
+arch                  = x86_64
+source                = thirdparty
+maintainer            = ToyCaptain
+distributor           = ToyCaptain
+desktop_uidir         = ui
+desktop_applaunchname = App.DocConverter.Application

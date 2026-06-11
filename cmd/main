@@ -1,0 +1,25 @@
+#!/bin/bash
+case $1 in
+start)
+    # Docker Compose 由应用中心管理启动
+    exit 0
+    ;;
+stop)
+    exit 0
+    ;;
+status)
+    FILE_PATH="${TRIM_APPDEST}/docker/docker-compose.yaml"
+    DOCKER_NAME=""
+    if [ -f "$FILE_PATH" ]; then
+        DOCKER_NAME=$(grep "container_name" "$FILE_PATH" | awk -F ':' '{print $2}' | xargs)
+    fi
+    if [ -n "$DOCKER_NAME" ]; then
+        docker inspect "$DOCKER_NAME" | grep -q '"Status": "running",' || exit 3
+        exit 0
+    fi
+    exit 3
+    ;;
+*)
+    exit 1
+    ;;
+esac
