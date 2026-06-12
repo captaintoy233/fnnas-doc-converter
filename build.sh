@@ -1,5 +1,5 @@
 #!/bin/bash
-# DocConverter Docker 构建脚本
+# DocConverter v2.0 构建脚本
 # 在飞牛OS或任意有Docker的机器上运行
 
 set -e
@@ -7,21 +7,31 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-echo "🚀 DocConverter Docker 构建"
-echo "========================"
+echo "🚀 DocConverter v2.0 Docker 构建"
+echo "================================"
 
 # 1. 构建转换器镜像
 echo ""
-echo "📦 [1/3] 构建转换器镜像..."
-docker build -t docconverter:1.0.0 -f app/server/Dockerfile app/server/
+echo "📦 [1/4] 构建转换器镜像..."
+docker build -t docconverter:2.0.0 -f app/server/Dockerfile app/server/
 
-# 2. 测试容器启动
+# 2. 创建数据目录
 echo ""
-echo "🔍 [2/3] 启动测试容器..."
+echo "📁 [2/4] 创建数据目录..."
+mkdir -p /data/input /data/output /data/uploads
+
+# 3. 启动容器
+echo ""
+echo "🔍 [3/4] 启动容器..."
 docker rm -f doc-converter 2>/dev/null || true
 docker run -d --name doc-converter -p 8080:8080 \
-  -v docconverter_uploads:/data/uploads \
-  docconverter:1.0.0
+  -v /data/input:/data/input \
+  -v /data/output:/data/output \
+  -v /data/uploads:/data/uploads \
+  -e WEKNORA_ENABLED=false \
+  -e CONVERTER_SOURCE_DIR=/data/input \
+  -e CONVERTER_OUTPUT_DIR=/data/output \
+  docconverter:2.0.0
 
 # 等待服务启动
 echo "   等待服务就绪..."
@@ -35,24 +45,28 @@ for i in $(seq 1 10); do
   sleep 2
 done
 
-# 3. 验证转换功能
+# 4. 验证
 echo ""
-echo "🧪 [3/3] 验证转换功能..."
-echo "   支持的格式:"
-curl -s http://localhost:8080/api/formats | python3 -m json.tool
+echo "🧪 [4/4] 验证..."
+echo "   健康检查:"
+curl -s http://localhost:8080/api/health | python3 -m json.tool
+echo ""
 
-# 测试 OFD 转换
-echo ""
-echo "   转换测试 (OFD):"
-curl -s -X POST http://localhost:8080/api/convert \
-  -F "file=@test_sample.ofd" 2>/dev/null \
-  | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'   ✅ {d[\"filename\"]}: {d[\"length\"]} chars via {d[\"converter\"]}')" \
-  || echo "   ⚠️ 跳过OFD测试 (无测试文件)"
+# 复制测试样本到源目录
+if [ -d "test_samples" ]; then
+  cp test_samples/* /data/input/ 2>/dev/null || true
+  echo "   测试文件已复制到 /data/input/"
+fi
 
 echo ""
 echo "✅ 构建完成!"
 echo ""
+echo "📋 访问地址:"
+echo "   Web UI:     http://localhost:8080"
+echo "   API 文档:   http://localhost:8080/docs"
+echo ""
 echo "📋 后续命令:"
-echo "   docker stop doc-converter     # 停止测试容器"
-echo "   docker compose up -d          # 启动全栈 (含WeKnora)"
-echo "   docker compose -f app/docker/docker-compose.yaml up -d  # 飞牛编排"
+echo "   全栈部署 (含WeKnora): docker compose up -d"
+echo "   查看日志:              docker logs -f doc-converter"
+echo "   放入源文件:            cp <文件> /data/input/"
+echo "   查看输出:              ls /data/output/"
