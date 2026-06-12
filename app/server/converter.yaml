@@ -1,0 +1,51 @@
+# DocConverter 系统配置
+# 所有配置项均可通过环境变量覆盖
+# 环境变量前缀 CONVERTER_ 或 WEKNORA_
+
+server:
+  host: "0.0.0.0"
+  port: 8080
+
+converter:
+  upload_dir: "/data/uploads"     # 上传临时目录
+  output_dir: "/data/output"      # 输出 Markdown 目录 (保留源目录结构)
+  temp_dir: "/data/tmp"           # 临时文件目录
+  keep_uploaded: false            # 转换后是否保留上传文件
+
+scanner:
+  enabled: false
+  source_dir: "/data/input"       # 源目录: 要转换的文档放在这里
+  recursive: true                 # 递归扫描子目录
+  include_extensions:             # 要处理的文件类型
+    - ".ofd"
+    - ".wps"
+    - ".docx"
+    - ".xlsx"
+    - ".et"
+    - ".pdf"
+    - ".htm"
+    - ".html"
+    - ".pptx"
+    - ".ppt"
+    - ".dps"
+  exclude_patterns: ["~*", ".*", "*.tmp", "*.bak"]
+  poll_interval: 60               # 扫描间隔 (秒)
+
+watcher:
+  enabled: false
+  source_dir: "/data/input"
+  recursive: true
+  debounce: 5                     # 变化去抖 (秒)
+
+weknora:
+  enabled: false                  # 设置为 true 启用 WeKnora 推送
+  api_url: ""                     # WeKnora API 地址 (如 http://weknora-app:18080)
+  api_key: ""                     # API Key (如有)
+  dataset_id: ""                  # 数据集 ID
+  auto_push: true                 # 转换后自动推送到 WeKnora
+  delete_source_after_push: false # 推送后删除源文件
+
+batch:
+  workers: 2                      # 并行转换数
+  retry_count: 3                  # 失败重试次数
+  retry_delay: 5                  # 重试间隔 (秒)

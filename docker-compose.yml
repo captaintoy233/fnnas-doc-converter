@@ -1,8 +1,6 @@
 # DocConverter + WeKnora 全栈部署
-# 适用: 任意 Docker 环境 (非 fnOS 也可用)
 # 使用: docker compose up -d
-
-version: "3.8"
+# 配置环境变量: .env 文件或直接在 shell 中 export
 
 networks:
   docnet:
@@ -11,53 +9,86 @@ networks:
 services:
   # ── 格式转换器 ──
   converter:
-    build: ./app/server
-    image: docconverter:1.0.0
+    build:
+      context: ./app/server
+      dockerfile: Dockerfile
+    image: docconverter:2.0.0
     container_name: doc-converter
     ports:
-      - "8080:8080"
+      - "${CONVERTER_PORT:-8080}:8080"
     environment:
-      WEKNORA_URL: "http://weknora-app:18080"
+      # 配置覆盖 (通过环境变量)
+      WEKNORA_URL: "${WEKNORA_URL:-http://weknora-app:18080}"
+      WEKNORA_ENABLED: "${WEKNORA_ENABLED:-true}"
+      WEKNORA_AUTO_PUSH: "${WEKNORA_AUTO_PUSH:-true}"
+      WEKNORA_DATASET_ID: "${WEKNORA_DATASET_ID:-}"
+      WEKNORA_API_KEY: "${WEKNORA_API_KEY:-}"
+      BATCH_WORKERS: "${BATCH_WORKERS:-2}"
+      CONVERTER_SOURCE_DIR: "/data/input"
+      CONVERTER_OUTPUT_DIR: "/data/output"
+      CONVERTER_WATCH_ENABLED: "${CONVERTER_WATCH_ENABLED:-false}"
     volumes:
-      - uploads:/data/uploads
-      - weknora_data:/data/weknora
+      - input_data:/data/input        # 源文件放入此目录
+      - output_data:/data/output      # 转换结果输出到此目录
+      - upload_data:/data/uploads     # 上传临时文件
     networks:
       - docnet
     restart: unless-stopped
+    depends_on:
+      weknora-app:
+        condition: service_started
 
   # ── WeKnora 知识库平台 ──
   weknora-app:
-    image: tencent/weknora-app:latest
+    image: hub.1panel.dev/wechatopenai/weknora-app:latest
     container_name: weknora-app
     ports:
-      - "18080:18080"
+      - "${WEKNORA_APP_PORT:-18080}:18080"
+    environment:
+      SYSTEM_AES_KEY: "${SYSTEM_AES_KEY:-}"
+      TENANT_AES_KEY: "${TENANT_AES_KEY:-}"
+      LARGE_LANGUAGE_MODEL_TYPE: "${LLM_TYPE:-ollama}"
+      LARGE_LANGUAGE_MODEL_HOST: "${LLM_HOST:-host.docker.internal:11434}"
     volumes:
-      - weknora_data:/app/data
+      - weknora_app_data:/app/data
+      - weknora_plugins:/app/plugins
     networks:
       - docnet
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_started
+      minio:
+        condition: service_started
     restart: unless-stopped
 
   weknora-docreader:
-    image: tencent/weknora-docreader:latest
+    image: hub.1panel.dev/wechatopenai/weknora-docreader:latest
     container_name: weknora-docreader
-    volumes:
-      - ./patches:/opt/weknora-patches:ro
-    entrypoint: ["/opt/weknora-patches/startup.sh"]
+    networks:
+      - docnet
+    restart: unless-stopped
+
+  weknora-frontend:
+    image: hub.1panel.dev/wechatopenai/weknora-ui:latest
+    container_name: weknora-frontend
+    ports:
+      - "${WEKNORA_UI_PORT:-18081}:80"
+    environment:
+      API_URL: "http://weknora-app:18080"
     networks:
       - docnet
     restart: unless-stopped
 
   # ── 基础设施 ──
   postgres:
-    image: postgres:16-alpine
+    image: hub.1panel.dev/paradedb/paradedb:v0.22.2-pg17
     container_name: weknora-pg
     environment:
       POSTGRES_DB: weknora
       POSTGRES_USER: weknora
-      POSTGRES_PASSWORD: weknora123
+      POSTGRES_PASSWORD: "${PG_PASSWORD:-weknora123}"
     volumes:
       - pg_data:/var/lib/postgresql/data
     networks:
@@ -69,7 +100,38 @@ services:
       retries: 5
     restart: unless-stopped
 
+  redis:
+    image: hub.1panel.dev/library/redis:7.0-alpine
+    container_name: weknora-redis
+    command: redis-server --requirepass "${REDIS_PASSWORD:-weknora123}"
+    volumes:
+      - redis_data:/data
+    networks:
+      - docnet
+    restart: unless-stopped
+
+  minio:
+    image: hub.1panel.dev/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: weknora-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: "${MINIO_USER:-weknora}"
+      MINIO_ROOT_PASSWORD: "${MINIO_PASSWORD:-weknora123}"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - docnet
+    restart: unless-stopped
+
 volumes:
-  uploads:
-  weknora_data:
+  input_data:
+  output_data:
+  upload_data:
   pg_data:
+  redis_data:
+  minio_data:
+  weknora_app_data:
+  weknora_plugins:
