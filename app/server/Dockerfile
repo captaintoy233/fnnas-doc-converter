@@ -1,6 +1,6 @@
 # DocConverter Docker 镜像
 # 纯 Python 转换器层 (~70MB)，不包含 LibreOffice/Tesseract
-FROM python:3.11-slim-bookworm
+FROM hub.1panel.dev/library/python:3.11-slim-bookworm
 
 WORKDIR /app
 
