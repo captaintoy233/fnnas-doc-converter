@@ -680,22 +680,27 @@ async function updateWeKnoraStatus() {
 }
 
 // ── 输出文件浏览 ──
+function escHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
 async function loadOutputFiles(path) {
   path = path || '';
   const r = await fetch('/api/output?path=' + encodeURIComponent(path));
   const d = await r.json();
   if (d.is_dir) {
-    let html = '<div style="margin-bottom:8px"><button class="btn btn-outline" onclick="loadOutputFiles()">🏠 根目录</button></div>';
-    if (path) html += '<p style="color:#94a3b8;margin-bottom:8px">📁 ' + path + '/</p>';
-    html += '<table><tr><th>名称</th><th>大小</th></tr>';
-    for (const item of d.items) {
+    const items = d.items.map(function(item) {
       if (item.is_dir) {
-        html += '<tr><td><a onclick="loadOutputFiles(\''+item.path+'\')" style="color:#38bdf8;cursor:pointer">📁 ' + item.name + '</a></td><td>-</td></tr>';
+        return '<tr><td><a onclick="loadOutputFiles('+JSON.stringify(item.path)+')" style="color:#38bdf8;cursor:pointer">📁 ' + escHtml(item.name) + '</a></td><td>-</td></tr>';
       } else {
-        html += '<tr><td><a onclick="viewOutputFile(\''+item.path+'\')" style="color:#e2e8f0;cursor:pointer">📄 ' + item.name + '</a></td><td>' + item.size + 'B</td></tr>';
+        return '<tr><td><a onclick="viewOutputFile('+JSON.stringify(item.path)+')" style="color:#e2e8f0;cursor:pointer">📄 ' + escHtml(item.name) + '</a></td><td>' + item.size + 'B</td></tr>';
       }
-    }
-    html += '</table>';
+    }).join('');
+    var html = '<div style="margin-bottom:8px"><button class="btn btn-outline" onclick="loadOutputFiles()">🏠 根目录</button></div>';
+    if (path) html += '<p style="color:#94a3b8;margin-bottom:8px">📁 ' + escHtml(path) + '/</p>';
+    html += '<table><tr><th>名称</th><th>大小</th></tr>' + items + '</table>';
     document.getElementById('outputFiles').innerHTML = html;
   }
 }
@@ -704,8 +709,8 @@ async function viewOutputFile(path) {
   const r = await fetch('/api/output?path=' + encodeURIComponent(path));
   const d = await r.json();
   const html = '<div style="margin-bottom:8px"><button class="btn btn-outline" onclick="loadOutputFiles()">← 返回</button></div>' +
-    '<p style="color:#94a3b8;margin-bottom:8px">📄 ' + path + ' (' + d.size + 'B)</p>' +
-    '<pre>' + d.content + '</pre>';
+    '<p style="color:#94a3b8;margin-bottom:8px">📄 ' + escHtml(path) + ' (' + d.size + 'B)</p>' +
+    '<pre>' + escHtml(d.content) + '</pre>';
   document.getElementById('outputFiles').innerHTML = html;
 }
 
