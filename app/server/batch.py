@@ -5,7 +5,7 @@
 - 通过 SyncRegistry 增量跳过未变化的文件
 - WeKnora 推送放入独立后台队列，不阻塞转换主流程
 """
-import os, time, threading, json, shutil, queue
+import os, time, logging, threading, json, shutil, queue
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Callable
@@ -42,18 +42,121 @@ _batch_state = {
 
 _lock = threading.Lock()
 
-# ── 异步推送队列 ──
-_push_queue: "queue.Queue[Optional[BatchTask]]" = queue.Queue()
-_push_thread = None
+# ── 异步推送队列（有界 + 多消费者 + 失败持久化 + 优雅退出） ──
+_push_stop_event = threading.Event()
+_push_threads: list = []
+_push_failed: list = []          # 最近推送失败的任务（供 /api/batch/retry-push 重推）
+_push_failed_lock = threading.Lock()
 
 
-def _start_push_worker():
-    """启动全局推送工作线程（幂等）"""
-    global _push_thread
-    if _push_thread is not None and _push_thread.is_alive():
+def _queue_maxsize() -> int:
+    try:
+        raw = get_config().get("weknora", {}).get("push_queue_size")
+        n = 200 if raw in (None, "") else int(raw)
+    except Exception:
+        n = 200
+    return max(1, n)
+
+
+# 有界队列在导入时创建（满则背压，阻塞生产者）；容量取启动时配置，变更需重启
+_push_queue = queue.Queue(maxsize=_queue_maxsize())
+
+
+def _get_push_queue() -> "queue.Queue":
+    """返回有界推送队列（导入时创建；容量变更需重启生效）"""
+    return _push_queue
+
+
+def _ensure_push_workers():
+    """确保有足够推送消费者（幂等；停止态不启动）"""
+    global _push_threads
+    if _push_stop_event.is_set():
         return
-    _push_thread = threading.Thread(target=_push_worker_loop, daemon=True)
-    _push_thread.start()
+    _get_push_queue()
+    try:
+        raw = get_config().get("weknora", {}).get("push_workers")
+        n = 2 if raw in (None, "") else int(raw)
+    except Exception:
+        n = 2
+    n = max(1, min(n, 16))
+    alive = [t for t in _push_threads if t.is_alive()]
+    _push_threads = alive
+    while len(alive) < n:
+        t = threading.Thread(target=_push_worker_loop, daemon=True)
+        t.start()
+        alive.append(t)
+
+
+def shutdown_push_workers(drain: bool = True, timeout: float = 30.0):
+    """优雅停止推送线程。drain=True 时等待队列排空（在途任务完成）后退出。"""
+    logger = logging.getLogger("docconverter.batch")
+    if not _push_threads:
+        return
+    if drain and _push_queue is not None:
+        try:
+            _push_queue.join()
+        except Exception:
+            pass
+    _push_stop_event.set()
+    deadline = time.time() + timeout
+    for t in _push_threads:
+        t.join(timeout=max(0.1, deadline - time.time()))
+    _push_threads = [t for t in _push_threads if t.is_alive()]
+    logger.info("推送线程已停止（存活 %d）", len(_push_threads))
+
+
+def _persist_push_failed(task, error):
+    """推送失败持久化为 JSONL（审计/排障；写失败仅告警）"""
+    logger = logging.getLogger("docconverter.batch")
+    try:
+        path = get_config().get("weknora", {}).get(
+            "push_failed_path", "/data/push_failed.jsonl")
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        rec = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "source": str(task.file_info.path),
+            "rel_path": task.file_info.rel_path,
+            "push_original": task.push_original,
+            "output_files": list(task.output_files or []),
+            "error": (error or "")[:500],
+        }
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.warning("推送失败记录写入失败: %s", e)
+
+
+def _record_push_failed(task, error):
+    """登记推送失败任务（内存供重推 + JSONL 审计）"""
+    with _push_failed_lock:
+        _push_failed.append(task)
+        if len(_push_failed) > 1000:
+            _push_failed.pop(0)
+    _persist_push_failed(task, error)
+
+
+def retry_failed_pushes() -> dict:
+    """将最近推送失败的任务重新入队重推（返回重推数量）"""
+    with _push_failed_lock:
+        tasks = list(_push_failed)
+    if not tasks:
+        return {"requeued": 0, "message": "无待重推的失败任务"}
+    q = _get_push_queue()
+    _ensure_push_workers()
+    requeued = 0
+    for task in tasks:
+        task.weknora_push = PUSH_PENDING
+        task.weknora_error = ""
+        q.put(task)
+        requeued += 1
+    with _push_failed_lock:
+        _push_failed.clear()
+    return {"requeued": requeued}
+
+
+def failed_push_count() -> int:
+    with _push_failed_lock:
+        return len(_push_failed)
 
 
 def _sanitize_md_for_weknora(content: str) -> str:
@@ -118,19 +221,19 @@ def _delete_old_docs(client, rec: dict, source_path: str):
 
 
 def _push_worker_loop():
-    """消费推送队列：转换成功后异步推送到 WeKnora
+    """推送消费者：从有界队列取任务推送到 WeKnora（多消费者之一）。
 
-    注意: 每个任务重新创建客户端并读取最新配置，
+    阻塞 get 带 1s 超时以便响应停止事件；每个任务读取最新配置，
     避免配置热更新（/api/config/update）后仍连接旧地址/旧凭据。
     """
-    from weknora_client import WeKnoraClient  # noqa: F401
-    logger = __import__("logging").getLogger("docconverter.batch")
+    logger = logging.getLogger("docconverter.batch")
 
-    while True:
-        task = _push_queue.get()
+    while not _push_stop_event.is_set():
         try:
-            if task is None:
-                break
+            task = _push_queue.get(timeout=1.0)
+        except queue.Empty:
+            continue
+        try:
             if task.weknora_push != PUSH_PENDING:
                 continue
 
@@ -139,6 +242,7 @@ def _push_worker_loop():
             if not client.is_configured():
                 task.weknora_error = "WeKnora 未配置，跳过推送"
                 task.weknora_push = PUSH_FAILED
+                _record_push_failed(task, task.weknora_error)
                 continue
 
             source_path = str(task.file_info.path)
@@ -195,6 +299,7 @@ def _push_worker_loop():
                 else:
                     task.weknora_error = result.get("error", "推送失败")
                     task.weknora_push = PUSH_FAILED
+                    _record_push_failed(task, task.weknora_error)
                     logger.error("推送失败: %s: %s", source_path, task.weknora_error)
                 continue
 
@@ -203,6 +308,7 @@ def _push_worker_loop():
             if not files_to_push:
                 task.weknora_push = PUSH_FAILED
                 task.weknora_error = "无 Markdown 内容可推送"
+                _record_push_failed(task, task.weknora_error)
                 continue
 
             if wk_cfg.get("push_as_file", True):
@@ -262,6 +368,7 @@ def _push_worker_loop():
                 else:
                     task.weknora_push = PUSH_FAILED
                     task.weknora_error = "; ".join(failed_detail[:3]) or "推送失败"
+                    _record_push_failed(task, task.weknora_error)
                     logger.error("推送失败: %s: %s", source_path, task.weknora_error)
             else:
                 # manual 模式：逐个输出文件推送（多文件源 CHM 章节/压缩包完整入库）
@@ -322,9 +429,11 @@ def _push_worker_loop():
                 else:
                     task.weknora_push = PUSH_FAILED
                     task.weknora_error = "; ".join(failed_detail[:3]) or "推送失败"
+                    _record_push_failed(task, task.weknora_error)
                     logger.error("推送失败: %s: %s", source_path, task.weknora_error)
         except Exception as e:
             logger.error("推送线程异常: %s", e)
+            _record_push_failed(task, "推送线程异常: {}".format(e))
         finally:
             _push_queue.task_done()
 
@@ -341,8 +450,8 @@ def enqueue_push(task: "BatchTask", use_push: bool = True):
             task.weknora_doc_id = rec.get("weknora_doc_id", "")
             return
     task.weknora_push = PUSH_PENDING
-    _start_push_worker()
-    _push_queue.put(task)
+    _ensure_push_workers()
+    _get_push_queue().put(task)   # 阻塞（背压）：队列满时等待消费
 
 
 class BatchTask:
@@ -593,6 +702,15 @@ def start_batch(files: list, progress_callback: Optional[Callable] = None,
             },
         }
 
+    # 重置推送停止事件（允许上一轮 stop 后重新起消费者）
+    _push_stop_event.clear()
+    # 可选：批次前清理已删源文件的陈旧注册表记录（仅在批次恒为全量源目录扫描时安全开启）
+    if bool(config.get("registry", {}).get("prune_on_batch", False)):
+        try:
+            get_registry().prune([str(f.path) for f in files])
+        except Exception:
+            pass
+
     pending_tasks = list(tasks)
 
     def _process_result(task: BatchTask):
@@ -658,6 +776,7 @@ def get_batch_status() -> dict:
     """获取批次状态"""
     with _lock:
         tasks_preview = [t.to_dict() for t in _batch_state["tasks"][:200]]
+        q = _push_queue
         return {
             "status": _batch_state["status"],
             "started_at": _batch_state["started_at"],
@@ -665,7 +784,9 @@ def get_batch_status() -> dict:
             "statistics": _batch_state["statistics"],
             "tasks": tasks_preview,
             "total_tasks": len(_batch_state["tasks"]),
-            "push_queue_size": _push_queue.qsize(),
+            "push_queue_size": q.qsize() if q is not None else 0,
+            "push_failed_count": failed_push_count(),
+            "push_workers": len([t for t in _push_threads if t.is_alive()]),
         }
 
 

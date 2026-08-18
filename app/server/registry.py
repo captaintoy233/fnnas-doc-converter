@@ -9,6 +9,7 @@
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import threading
 import time
@@ -24,12 +25,15 @@ class SyncRegistry:
         self._data = self._load()
 
     def _load(self) -> dict:
-        try:
-            with open(self.path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return data if isinstance(data, dict) else {}
-        except Exception:
-            return {}
+        # 主文件损坏时回退 .bak，避免一次写坏导致全量重转
+        for candidate in (self.path, self.path.with_name(self.path.name + ".bak")):
+            try:
+                with open(candidate, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    return data if isinstance(data, dict) else {}
+            except Exception:
+                continue
+        return {}
 
     def _save(self):
         try:
@@ -37,12 +41,22 @@ class SyncRegistry:
             tmp = self.path.with_name(self.path.name + ".tmp")
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(self._data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
             try:
                 os.replace(tmp, self.path)
             except OSError:
-                # 单文件 bind mount 场景
+                # 单文件 bind mount 场景：直写前先备份旧文件，直写中途崩溃可回退
+                bak = self.path.with_name(self.path.name + ".bak")
+                if self.path.exists():
+                    try:
+                        shutil.copyfile(self.path, bak)
+                    except OSError:
+                        pass
                 with open(self.path, "w", encoding="utf-8") as f:
                     json.dump(self._data, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
                 try:
                     tmp.unlink()
                 except OSError:

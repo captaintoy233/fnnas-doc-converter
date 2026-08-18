@@ -79,6 +79,9 @@ DEFAULT_CONFIG = {
         "tenant_id": "",               # 平台级 API Key 时的 X-Tenant-ID（可选）
         "delete_source_after_push": False,
         "retry_count": 3,
+        "push_queue_size": 200,        # 有界推送队列容量（满则背压，等待消费）
+        "push_workers": 2,             # 推送消费者线程数
+        "push_failed_path": "/data/push_failed.jsonl",  # 推送失败持久化（审计/重推）
     },
     "batch": {
         "workers": 4,
@@ -106,6 +109,7 @@ DEFAULT_CONFIG = {
         "backend": "json",            # json | sqlite
         "path": "/data/registry.json",
         "sqlite_path": "/data/registry.sqlite",
+        "prune_on_batch": False,      # 批次前清理已删源文件记录（仅在批次恒为全量源目录扫描时开启）
     },
 }
 
@@ -148,6 +152,9 @@ ENV_MAP = [
     ("CONVERTER_REGISTRY_BACKEND", ["registry", "backend"], str),
     ("CONVERTER_REGISTRY_SQLITE", ["registry", "sqlite_path"], str),
     ("WEKNORA_DELETE_REPLACED", ["weknora", "delete_replaced"], bool),
+    ("WEKNORA_PUSH_QUEUE_SIZE", ["weknora", "push_queue_size"], int),
+    ("WEKNORA_PUSH_WORKERS", ["weknora", "push_workers"], int),
+    ("WEKNORA_PUSH_FAILED_PATH", ["weknora", "push_failed_path"], str),
     ("BATCH_WORKERS", ["batch", "workers"], int),
     ("BATCH_RETRY_COUNT", ["batch", "retry_count"], int),
     ("BATCH_RETRY_DELAY", ["batch", "retry_delay"], int),
