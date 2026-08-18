@@ -46,6 +46,44 @@ def sanitize_filename(name: str) -> str:
     return name
 
 
+def normalize_rel_path(rel_path: str,
+                       max_segment: int = 128,
+                       max_depth: int = 16,
+                       max_total: int = 1024) -> str:
+    """归一化 WeKnora fileName 相对路径（防畸形路径/过长/穿越）。
+
+    - 反斜杠→正斜杠；去空段/`.`；移除 `..`（WeKnora 端只按 / 拆文件夹，
+      `..` 无真实文件系统语义，直接移除更稳）
+    - 单段长度 ≤ max_segment（保留扩展名截断主名）
+    - 深度 ≤ max_depth（超深保留最深层，保住文件名）
+    - 总长 ≤ max_total
+    结果始终为不带前导 / 的相对路径（空串表示未提供）。
+    """
+    if not rel_path:
+        return ""
+    cleaned = []
+    for part in str(rel_path).replace("\\", "/").split("/"):
+        if part in ("", ".", ".."):
+            continue
+        part = part.strip()
+        if not part:
+            continue
+        if len(part) > max_segment:
+            stem, dot, ext = part.rpartition(".")
+            if dot and 1 <= len(ext) <= 10:
+                keep = max(1, max_segment - len(ext) - 1)
+                part = stem[:keep] + "." + ext
+            else:
+                part = part[:max_segment]
+        cleaned.append(part)
+    if len(cleaned) > max_depth:
+        cleaned = cleaned[-max_depth:]
+    out = "/".join(cleaned)
+    if len(out) > max_total:
+        out = out[:max_total]
+    return out
+
+
 class WeKnoraClient:
     """WeKnora 知识库 API 客户端"""
 
@@ -72,6 +110,7 @@ class WeKnoraClient:
                                         DEFAULT_MAX_FILE_SIZE_MB) or DEFAULT_MAX_FILE_SIZE_MB) * 1024 * 1024
         self._token = None
         self._token_expiry = 0
+        self._refresh_token = None
         self._kb_id = None
         self._kb_name = None
         self._kb_error = ""
@@ -132,6 +171,9 @@ class WeKnoraClient:
                 if token:
                     self._token = token
                     self._token_expiry = time.time() + 3300  # 略小于 1 小时
+                    # 存储 refresh_token：401 时优先刷新换新，减少整体重登
+                    self._refresh_token = (data.get("refresh_token")
+                                           or (data.get("data") or {}).get("refresh_token"))
                     # 注意: 官方登录 DTO 无 tenant.api_key 字段（auth_dto.go），
                     # 仅用户的 fork 会注入；此处为尽力拾取，取不到则继续用 JWT
                     tenant = data.get("tenant") or data.get("active_tenant") or {}
@@ -144,6 +186,33 @@ class WeKnoraClient:
         except Exception as e:
             logger.error("WeKnora login failed: %s", e)
         self._token = None
+
+    def _try_refresh(self) -> bool:
+        """用 refresh_token 换新 access token（尽力；任何失败返回 False 由调用方重登）"""
+        if not self._refresh_token:
+            return False
+        try:
+            resp = requests.post(
+                "{}/api/v1/auth/refresh".format(self.api_url),
+                json={"refresh_token": self._refresh_token},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                token = data.get("token") or (data.get("data") or {}).get("token")
+                if token:
+                    self._token = token
+                    self._token_expiry = time.time() + 3300
+                    rt = (data.get("refresh_token")
+                          or (data.get("data") or {}).get("refresh_token"))
+                    if rt:
+                        self._refresh_token = rt
+                    logger.info("WeKnora token refreshed")
+                    return True
+            logger.warning("WeKnora refresh failed: HTTP %s", resp.status_code)
+        except Exception as e:
+            logger.warning("WeKnora refresh error: %s", e)
+        return False
 
     # ── API 调用 ──
 
@@ -167,13 +236,22 @@ class WeKnoraClient:
             return {"ok": False, "error": str(e)}
 
         if resp.status_code == 401 and not self.api_key and retry < 1:
-            # token 过期，重新登录后重试一次
+            # token 过期：优先用 refresh_token 换新，失败再整体重登，然后重试一次
             self._token = None
+            if not self._try_refresh():
+                self._login()
             return self._api_call(method, path, data, files, params, timeout, retry + 1)
 
         if resp.status_code >= 500 or resp.status_code == 429:
             if retry < self.retry_count:
-                time.sleep(min(2 ** (retry + 1), 10))
+                delay = min(2 ** (retry + 1), 10)
+                if resp.status_code == 429:
+                    # 尊重服务端 Retry-After（此处仅解析秒数；HTTP-date 忽略走退避）
+                    try:
+                        delay = max(delay, min(int(resp.headers.get("Retry-After", "")), 60))
+                    except (ValueError, TypeError):
+                        pass
+                time.sleep(delay)
                 return self._api_call(method, path, data, files, params, timeout, retry + 1)
 
         if resp.status_code == 409:
@@ -370,7 +448,7 @@ class WeKnoraClient:
         if not target_kb:
             return {"ok": False, "error": self._kb_error or "无法找到知识库"}
 
-        rel_path = rel_path.replace("\\", "/").lstrip("/")
+        rel_path = normalize_rel_path(rel_path)
         filename = sanitize_filename(rel_path)
         if not filename:
             filename = (sanitize_filename(title) or "未命名.md") + ".md"
@@ -436,7 +514,7 @@ class WeKnoraClient:
 
         doc_title = title or path.stem
         if rel_path:
-            filename = sanitize_filename(rel_path.replace("\\", "/").lstrip("/")) or path.name
+            filename = sanitize_filename(normalize_rel_path(rel_path)) or path.name
         else:
             filename = sanitize_filename(path.name) or path.name
 

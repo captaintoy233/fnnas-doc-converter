@@ -10,7 +10,8 @@ import uvicorn
 
 from config import get_config, reload_config, config_to_json, save_config, APP_VERSION
 from scanner import scan_directory, get_statistics
-from batch import start_batch, stop_batch, get_batch_status, clear_batch
+from batch import (start_batch, stop_batch, get_batch_status, clear_batch,
+                   retry_failed_pushes, failed_push_count, shutdown_push_workers)
 from watcher import start_watcher, stop_watcher, get_watcher_status
 from weknora_client import WeKnoraClient
 from converters import registry
@@ -33,6 +34,20 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ── 优雅退出：停止 watcher + drain 推送队列（在途推送任务完成） ──
+@app.on_event("shutdown")
+def _on_shutdown():
+    try:
+        stop_watcher()
+    except Exception:
+        pass
+    try:
+        shutdown_push_workers(drain=True, timeout=30)
+    except Exception:
+        pass
+
 
 # ── 可选 API 认证（server.auth_token 非空时启用）──
 _PUBLIC_PATHS = {"/", "/api/health", "/docs", "/openapi.json", "/redoc"}
@@ -212,6 +227,12 @@ def batch_stop():
 def batch_clear():
     clear_batch()
     return {"status": "cleared"}
+
+
+@app.post("/api/batch/retry-push")
+def batch_retry_push():
+    """将最近推送失败的任务重新入队重推（返回重推数量）"""
+    return retry_failed_pushes()
 
 
 # ── 文件监听 ──
@@ -418,6 +439,7 @@ _INT_KEYS = {
     ("chm", "extract_workers"), ("pdf", "ocr_dpi"),
     ("converter", "max_upload_mb"), ("converter", "port"),
     ("weknora", "max_file_size_mb"), ("weknora", "retry_count"),
+    ("weknora", "push_queue_size"), ("weknora", "push_workers"),
     ("scanner", "poll_interval"),
 }
 _BOOL_KEYS = {
@@ -755,6 +777,7 @@ pre { background:#0f172a; padding:14px; border-radius:6px; overflow-x:auto;
       <button class="btn btn-danger" onclick="stopBatch()">⏹ 停止</button>
       <button class="btn btn-outline" onclick="scanFiles()">📋 扫描文件</button>
       <button class="btn btn-outline" onclick="clearBatch()">🗑 清除</button>
+      <button class="btn btn-outline" onclick="retryPush()" id="btnRetryPush" disabled title="将最近推送失败的任务重新入队">🔄 重推失败 (<span id="retryPushCount">0</span>)</button>
     </div>
     <div id="scanResult"></div>
   </div>
@@ -1000,6 +1023,13 @@ function updateBatchUI(d) {
   const pct = s.total > 0 ? Math.round((s.completed||0)/s.total*100) : 0;
   document.getElementById('batchProgress').style.width = pct + '%';
 
+  // 推送失败计数 → 重推按钮
+  const failedPush = d.push_failed_count || 0;
+  const rc = document.getElementById('retryPushCount');
+  const rb = document.getElementById('btnRetryPush');
+  if (rc) rc.textContent = failedPush;
+  if (rb) rb.disabled = failedPush === 0;
+
   if (d.tasks && d.tasks.length > 0) {
     let html = '<table><tr><th>文件</th><th>格式</th><th>状态</th><th>WeKnora</th><th>结果</th></tr>';
     for (const t of d.tasks.slice(0,200)) {
@@ -1027,6 +1057,14 @@ function downloadFile(path) {
 
 async function stopBatch() { await fetch('/api/batch/stop', { method:'POST' }); }
 async function clearBatch() { await fetch('/api/batch/clear', { method:'POST' }); pollBatchStatus(); }
+async function retryPush() {
+  try {
+    const r = await fetch('/api/batch/retry-push', { method:'POST' });
+    const d = await r.json();
+    alert('已重新入队 ' + (d.requeued || 0) + ' 个失败任务');
+    pollBatchStatus();
+  } catch(e) { console.error(e); }
+}
 
 // ── 监听 ──
 async function startWatcher() {
