@@ -7,7 +7,7 @@ from pathlib import Path
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.1.1"
 APP_NAME = "DocConverter"
 
 CONFIG_PATHS = [

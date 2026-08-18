@@ -36,16 +36,26 @@
 | L1 | 弱默认口令 + MinIO 公网暴露 | compose 强制 .env 提供 PG/Redis/MinIO 口令；MinIO 不再暴露宿主端口 |
 | L4 | config update 无类型校验 + 批次线程无保护 | 叶子键类型白名单（400 拒绝非法类型）；批次线程异常复位状态 |
 
-### 待落地（按优先级）
-1. **[重要] 推送队列**：无界内存队列 + 单消费者 + daemon 线程 → 建议有界队列+背压、多消费者、失败任务持久化、优雅退出 drain
-2. **[重要] registry 可靠性**：崩溃半写丢失 → 建议直写前备份、批量聚合落盘、批量前 `prune()` 清理已删源文件
-3. **[重要] 推送结果校验**：轮询 `parse_status`、失败自动 reparse、UI 展示解析状态
-4. **[重要] refresh_token / X-Tenant-ID**：401 先刷新；平台级 API Key 需 tenant_id 配置
-5. **[一般] `available` 运行时探测**（镜像现已内置依赖，此条降级）
-6. **[一般] XML 实体扩展 DoS**（ofd/docx 底层解析）→ defusedxml
-7. **[一般] 归档转换全量驻留内存** → 边转边写
-8. **[一般] watcher 在批次运行期间丢新文件** → 积压队列
-9. **[一般] 版本号不统一**（manifest 1.0.1 vs APP_VERSION 2.1.0）
+### 已修复（v2.1.1 加固）
+| # | 问题 | 修复 |
+|---|------|------|
+| Q1 | 推送队列无界 + 单消费者 + 无持久化 + 无优雅退出 | 有界队列（`push_queue_size`，满则背压）+ 多消费者（`push_workers`）+ 失败任务 JSONL 持久化（`push_failed_path`）+ 优雅 drain（shutdown 钩子） |
+| Q2 | 推送失败无手动重推 | `POST /api/batch/retry-push` 重入队 + UI 重推按钮 + 状态展示失败数/队列深/消费者数 |
+| Q3 | registry 崩溃半写丢失 | 直写回退前 `.bak` 备份 + `fsync`；主文件损坏时从 `.bak` 恢复 |
+| Q4 | 批次前不清理已删源文件 | `registry.prune_on_batch`（默认关，仅全量源目录扫描时安全开启） |
+| Q5 | refresh_token 未用 | 登录存储 refresh_token，401 先刷新换新再整体重登 |
+| Q6 | 429 不尊重 Retry-After | `_api_call` 429 尊重 `Retry-After` 头 |
+| Q7 | rel_path 未归一化（`..`/超长/过深） | `normalize_rel_path`：去 `..` 防穿越、段≤128、深度≤16、总长≤1024 |
+| Q8 | 版本号不统一 | manifest 与 `APP_VERSION` 对齐（现 2.1.1） |
+
+### 待落地（按优先级，v2.1.1 后）
+1. **[重要] 推送结果校验补全**：`verify`/`verify-pushed` 对账已有；仍缺「失败自动 reparse」与「UI 内联展示解析状态」
+2. **[一般] registry 批量聚合落盘**：当前每次 record/mark_pushed 全量重写，千文件批次 O(n²)；建议批量缓冲 + 周期/收尾落盘
+3. **[一般] 超时随文件大小缩放**、JWT exp 精确解析
+4. **[一般] `available` 运行时探测**（镜像已内置依赖，此条降级）
+5. **[一般] XML 实体扩展 DoS**（ofd/docx 底层解析）→ defusedxml
+6. **[一般] 归档转换全量驻留内存** → 边转边写
+7. **[一般] watcher 在批次运行期间丢新文件** → 积压队列
 
 ---
 
@@ -64,14 +74,15 @@
 | **50MB 上限**（MAX_FILE_SIZE_MB，nginx 也参与） | `filesize.go` | ✅ `weknora.max_file_size_mb` 可配置 |
 | **文件夹结构**：fileName 相对路径 → SplitKnowledgeRelativePath 自动建目录 | `kb_folder.go` | ✅ 文件方式推送默认开启 |
 
-### 对接契约剩余风险（待落地）
-1. **[重要] 推送结果校验**：`POST` 返回 `parse_status=processing`，需轮询 `GET /knowledge/{id}` 确认 completed；建议加 `verify` 命令 + UI 展示解析状态 + 失败自动 reparse
-2. **[重要] refresh_token**：登录响应有 refresh_token（7 天），客户端应 401 时先刷新再重登，抗密码轮换
-3. **[重要] 平台级 X-API-Key**：需要 `X-Tenant-ID` 头，客户端加可选 `weknora.tenant_id`
-4. **[重要] 推送失败无手动重推**：新增 `POST /api/batch/retry-push` + UI 重推按钮 + 展示 push_queue_size/失败数
-5. **[一般] metadata 值需强转 str**（服务端 `map[string]string`，数字会 400）
-6. **[一般] 超时随文件大小缩放**、429 尊重 `Retry-After`、JWT exp 解析
-7. **[一般] rel_path 归一化对齐服务端**（去 `..`、段长 128/深度 16/总长 1024）
+### 对接契约剩余风险
+- ✅ **refresh_token**（v2.1.1）：401 先刷新换新再整体重登，抗密码轮换
+- ✅ **平台级 X-API-Key / X-Tenant-ID**：`weknora.tenant_id` 可选配置（第二轮已加）
+- ✅ **推送失败手动重推**（v2.1.1）：`POST /api/batch/retry-push` + UI 按钮 + 失败数/队列深展示
+- ✅ **429 尊重 Retry-After**（v2.1.1）
+- ✅ **rel_path 归一化**（v2.1.1）：去 `..` 防穿越、段≤128、深度≤16、总长≤1024
+- ⏳ **[重要] 推送结果校验**：`POST` 返回 `parse_status=processing`，需轮询 `GET /knowledge/{id}` 确认 completed；建议加 `verify` 命令 + UI 展示解析状态 + 失败自动 reparse
+- ⏳ **[一般] metadata 值强转 str**（服务端 `map[string]string`；当前推送的 metadata 值均已是 str，风险低）
+- ⏳ **[一般] 超时随文件大小缩放**、JWT exp 精确解析
 
 ---
 
@@ -95,14 +106,15 @@
 | 判重不含 folder_path（跨目录同名被 409 误拒） | ✅ 本地按输出相对路径追踪 doc_id；文档已说明约束 |
 | 每任务新建客户端 → 千文件千次登录 | ✅ 按配置签名缓存客户端 |
 | 多输出源增量跳过失效（每批全量重转） | ✅ 按 output_files 存在性判断 |
-| 推送队列单消费者/无界/丢任务 | ⏳ 待办（有界+多消费者+持久化） |
-| refresh_token 未用 / X-Tenant-ID 缺失 | 🟡 refresh_token 待办；**X-Tenant-ID 已加**（weknora.tenant_id） |
+| 推送队列单消费者/无界/丢任务 | ✅ v2.1.1 有界+多消费者+JSONL 持久化+优雅 drain+retry-push 重推 |
+| refresh_token 未用 / X-Tenant-ID 缺失 | ✅ v2.1.1 refresh_token 401 先刷新再重登；X-Tenant-ID 已加（weknora.tenant_id） |
 | **HTTP 200 ≠ 推送成功**（asynq 入队失败仍 200，需轮询 parse_status） | ✅ 新增 `verify_knowledge` / CLI `verify` / API `/api/weknora/verify` + `/verify-pushed` 对账 |
 | 登录字段实为 active_tenant，api_key 拾取是死代码 | ✅ 已修正注释与拾取逻辑（兼容 fork） |
 | 50MB 硬编码 | ✅ weknora.max_file_size_mb 可配置 |
 | api_url 归一化边界 | ✅ 增加 http/https 校验与明确报错 |
 | metadata 非字符串 400 | ✅ batch 元数据全为字符串（文档注明） |
-| 429 未尊重 Retry-After / 超时不随大小缩放 | ⏳ 待办 |
+| 429 未尊重 Retry-After / 超时不随大小缩放 | 🟡 v2.1.1 已尊重 429 Retry-After；超时随大小缩放待办 |
+| rel_path 未归一化 | ✅ v2.1.1 `normalize_rel_path`（去 .. / 段≤128 / 深≤16 / 总≤1024） |
 
 ## 三·六、第三轮审查（DeepSeek-V4-Pro 视角）新增修复
 
