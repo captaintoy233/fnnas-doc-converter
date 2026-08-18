@@ -20,7 +20,7 @@ services:
     build:
       context: ./app/server
       dockerfile: Dockerfile
-    image: docconverter:2.1.0
+    image: docconverter:2.1.1
     container_name: doc-converter
     restart: always
     ports:
