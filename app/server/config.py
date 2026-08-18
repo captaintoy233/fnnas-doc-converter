@@ -7,6 +7,9 @@ from pathlib import Path
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
+APP_VERSION = "2.1.0"
+APP_NAME = "DocConverter"
+
 CONFIG_PATHS = [
     Path("/app/config/converter.yaml"),
     Path("converter.yaml"),
@@ -18,20 +21,30 @@ DEFAULT_CONFIG = {
     "server": {
         "host": "0.0.0.0",
         "port": 8080,
+        # 可选 API 认证令牌：为空则不鉴权（内网模式）；
+        # 设置后所有 /api/* 需携带 Authorization: Bearer <token> 或 X-Auth-Token 头
+        "auth_token": "",
     },
     "converter": {
         "upload_dir": "/data/uploads",
         "output_dir": "/data/output",
         "temp_dir": "/data/tmp",
         "keep_uploaded": False,
+        "max_upload_mb": 1024,        # 单文件 API 上传上限 (MB)
+        # Windows 盘符/共享 → 本地挂载点映射（容器内运行时配置）
+        # 例: {"C:": "/mnt/c", "\\\\nas": "/mnt/nas"}
+        "drive_map": {},
     },
     "scanner": {
         "enabled": False,
         "source_dir": "/data/input",
         "recursive": True,
         "include_extensions": [
-            ".ofd", ".wps", ".docx", ".xlsx", ".et",
-            ".pdf", ".htm", ".html", ".pptx", ".ppt", ".dps"
+            ".ofd", ".wps", ".wpsx", ".dpsx", ".docx", ".xlsx", ".et", ".etx",
+            ".pdf", ".htm", ".html", ".pptx", ".ppt", ".dps",
+            ".doc", ".xls", ".chm",
+            ".eml", ".msg",
+            ".zip", ".rar", ".7z", ".tar", ".gz", ".tgz", ".bz2", ".tbz2", ".xz", ".txz",
         ],
         "exclude_patterns": ["~*", ".*", "*.tmp", "*.bak"],
         "poll_interval": 60,
@@ -50,23 +63,62 @@ DEFAULT_CONFIG = {
         "password": "",
         "dataset_id": "",
         "auto_push": True,
+        "push_original_on_missing": True,
+        "push_rel_title": True,        # 推送时标题用相对路径（保留目录结构）
+        "push_as_file": True,          # 以文件方式推送（fileName 携带相对路径 → WeKnora 文件夹）
+        "delete_replaced": True,       # 内容变化时先删除旧文档再推送（file 类型不支持更新）
+        "folder_kb_map_path": "",      # 文件夹→知识库映射文件路径（空=不启用多知识库路由）
+        "auto_reparse": True,          # 推送后自动触发 reparse（官方解析异步，需显式触发）
+        "db_enable": False,            # 推送后直连数据库启用文档（官方无启用 API；需在 WeKnora 网络内，破坏独立性，谨慎开启）
+        "db_host": "postgres",         # db_enable 时的 Postgres 地址
+        "db_port": 5432,
+        "db_name": "weknora",
+        "db_user": "postgres",
+        "db_password": "",
+        "max_file_size_mb": 50,        # 与服务端 MAX_FILE_SIZE_MB 对齐（默认 50）
+        "tenant_id": "",               # 平台级 API Key 时的 X-Tenant-ID（可选）
         "delete_source_after_push": False,
+        "retry_count": 3,
     },
     "batch": {
-        "workers": 2,
+        "workers": 4,
         "retry_count": 3,
         "retry_delay": 5,
+    },
+    "archive": {
+        "seven_zip_path": "7zz",
+        "max_depth": 3,               # 嵌套归档最大深度
+        "keep_extracted": False,       # 是否在输出目录保留解压出的原始文件
+        "max_extract_mb": 0,          # 解压配额 (MB, 0=默认 2GB)
+        "max_extract_entries": 0,     # 解压条目数配额 (0=默认 10 万)
+    },
+    "chm": {
+        "seven_zip_path": "7zz",
+        "extract_workers": 8,
+    },
+    "pdf": {
+        "ocr_enabled": False,
+        "ocr_command": "tesseract",
+        "ocr_lang": "chi_sim+eng",
+        "ocr_dpi": 200,
+    },
+    "registry": {
+        "backend": "json",            # json | sqlite
+        "path": "/data/registry.json",
+        "sqlite_path": "/data/registry.sqlite",
     },
 }
 
 # 环境变量映射表: (env_var, config_path, type)
 ENV_MAP = [
     ("CONVERTER_SERVER_PORT", ["server", "port"], int),
+    ("CONVERTER_AUTH_TOKEN", ["server", "auth_token"], str),
     ("CONVERTER_SERVER_HOST", ["server", "host"], str),
     ("CONVERTER_OUTPUT_DIR", ["converter", "output_dir"], str),
     ("CONVERTER_UPLOAD_DIR", ["converter", "upload_dir"], str),
     ("CONVERTER_TEMP_DIR", ["converter", "temp_dir"], str),
     ("CONVERTER_KEEP_UPLOADED", ["converter", "keep_uploaded"], bool),
+    ("CONVERTER_MAX_UPLOAD_MB", ["converter", "max_upload_mb"], int),
     ("CONVERTER_SOURCE_DIR", ["scanner", "source_dir"], str),
     ("CONVERTER_RECURSIVE", ["scanner", "recursive"], bool),
     ("CONVERTER_POLL_INTERVAL", ["scanner", "poll_interval"], int),
@@ -80,9 +132,34 @@ ENV_MAP = [
     ("WEKNORA_AUTO_PUSH", ["weknora", "auto_push"], bool),
     ("WEKNORA_EMAIL", ["weknora", "email"], str),
     ("WEKNORA_PASSWORD", ["weknora", "password"], str),
+    ("WEKNORA_PUSH_ORIGINAL", ["weknora", "push_original_on_missing"], bool),
+    ("WEKNORA_PUSH_REL_TITLE", ["weknora", "push_rel_title"], bool),
+    ("WEKNORA_PUSH_AS_FILE", ["weknora", "push_as_file"], bool),
+    ("WEKNORA_MAX_FILE_SIZE_MB", ["weknora", "max_file_size_mb"], int),
+    ("WEKNORA_TENANT_ID", ["weknora", "tenant_id"], str),
+    ("WEKNORA_FOLDER_KB_MAP", ["weknora", "folder_kb_map_path"], str),
+    ("WEKNORA_AUTO_REPARSE", ["weknora", "auto_reparse"], bool),
+    ("WEKNORA_DB_ENABLE", ["weknora", "db_enable"], bool),
+    ("WEKNORA_DB_HOST", ["weknora", "db_host"], str),
+    ("WEKNORA_DB_PORT", ["weknora", "db_port"], int),
+    ("WEKNORA_DB_NAME", ["weknora", "db_name"], str),
+    ("WEKNORA_DB_USER", ["weknora", "db_user"], str),
+    ("WEKNORA_DB_PASSWORD", ["weknora", "db_password"], str),
+    ("CONVERTER_REGISTRY_BACKEND", ["registry", "backend"], str),
+    ("CONVERTER_REGISTRY_SQLITE", ["registry", "sqlite_path"], str),
+    ("WEKNORA_DELETE_REPLACED", ["weknora", "delete_replaced"], bool),
     ("BATCH_WORKERS", ["batch", "workers"], int),
     ("BATCH_RETRY_COUNT", ["batch", "retry_count"], int),
     ("BATCH_RETRY_DELAY", ["batch", "retry_delay"], int),
+    ("ARCHIVE_SEVEN_ZIP_PATH", ["archive", "seven_zip_path"], str),
+    ("ARCHIVE_MAX_DEPTH", ["archive", "max_depth"], int),
+    ("ARCHIVE_KEEP_EXTRACTED", ["archive", "keep_extracted"], bool),
+    ("CHM_SEVEN_ZIP_PATH", ["chm", "seven_zip_path"], str),
+    ("CHM_EXTRACT_WORKERS", ["chm", "extract_workers"], int),
+    ("PDF_OCR_ENABLED", ["pdf", "ocr_enabled"], bool),
+    ("PDF_OCR_COMMAND", ["pdf", "ocr_command"], str),
+    ("PDF_OCR_LANG", ["pdf", "ocr_lang"], str),
+    ("CONVERTER_REGISTRY_PATH", ["registry", "path"], str),
 ]
 
 
@@ -102,12 +179,20 @@ def deep_get(d, keys):
     return d
 
 
+def _config_paths() -> list:
+    """配置文件路径列表（可用 CONVERTER_CONFIG_FILE 覆盖，测试/多实例用）"""
+    override = os.environ.get("CONVERTER_CONFIG_FILE")
+    if override:
+        return [Path(override)]
+    return CONFIG_PATHS
+
+
 def load_config() -> dict:
     """加载配置: Yaml文件 → 环境变量覆盖"""
     config = dict(DEFAULT_CONFIG)
 
     # 1. 尝试加载 YAML 配置文件
-    for path in CONFIG_PATHS:
+    for path in _config_paths():
         if path.exists():
             with open(path) as f:
                 try:
@@ -150,6 +235,53 @@ def _deep_merge(base, override):
             _deep_merge(base[key], value)
         else:
             base[key] = value
+
+
+def save_config(updates: dict) -> bool:
+    """将部分配置更新写入配置文件（第一个可写的 CONFIG_PATHS），并热重载。
+
+    优先级: 已有配置文件 > 当前目录 converter.yaml > 家目录。
+
+    Args:
+        updates: 与 config 结构一致的嵌套 dict（部分更新即可）
+
+    Returns:
+        True 保存成功并已重载；False 无任何可写位置
+    """
+    current = get_config()
+    merged = json.loads(json.dumps(current))
+    _deep_merge(merged, updates)
+
+    target = None
+    for p in _config_paths():
+        if p.exists():
+            target = p
+            break
+    if target is None:
+        target = _config_paths()[0]
+
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(target.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            yaml.safe_dump(merged, f, allow_unicode=True, sort_keys=False)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.replace(tmp, target)   # 原子替换
+        except OSError:
+            # 单文件 bind mount 等不支持 rename 的场景：回退直写
+            with open(target, "w", encoding="utf-8") as f:
+                yaml.safe_dump(merged, f, allow_unicode=True, sort_keys=False)
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+    except Exception:
+        return False
+
+    reload_config()
+    return True
 
 
 # 全局配置实例

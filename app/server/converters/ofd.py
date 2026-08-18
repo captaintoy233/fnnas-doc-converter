@@ -151,12 +151,16 @@ class OFDParser:
         return "\n".join(parts)
 
     def _is_heading(self, font, size, text):
-        if not text or len(text) < 6: return None
+        if not text:
+            return None
         hn = bool(re.match(r'^[（(]?[一二三四五六七八九十百千]+[）).、：:]', text))
         if font in HEADING_FONTS:
+            # 标题字体（黑体/宋体等）即使较短也视为标题
             if size >= 10: return 1
             if size >= 7: return 2
             if size >= 5.5: return 3 if hn else 2
+            return None
+        if len(text) < 6:
             return None
         if size >= 7: return 2
         if size >= 5.5 and hn: return 3

@@ -6,11 +6,12 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from config import get_config
+from paths import to_local_path
 
 
 class FileInfo:
     """扫描到的文件信息"""
-    __slots__ = ('path', 'rel_path', 'ext', 'size', 'mtime')
+    __slots__ = ('path', 'rel_path', 'ext', 'size', 'mtime', 'size_str')
 
     def __init__(self, path: Path, base_dir: Path):
         self.path = path
@@ -18,6 +19,7 @@ class FileInfo:
         self.ext = path.suffix.lower()
         self.size = path.stat().st_size
         self.mtime = path.stat().st_mtime
+        self.size_str = _format_size(self.size)
 
     def to_dict(self):
         return {
@@ -25,7 +27,7 @@ class FileInfo:
             "rel_path": self.rel_path,
             "ext": self.ext,
             "size": self.size,
-            "size_str": _format_size(self.size),
+            "size_str": self.size_str,
             "mtime": self.mtime,
         }
 
@@ -80,7 +82,8 @@ def scan_directory(
     include_extensions = [e.lower() if e.startswith('.') else f'.{e.lower()}'
                           for e in include_extensions]
 
-    base = Path(source_dir)
+    # 支持 Windows 路径配置（容器内通过 drive_map 映射）
+    base = to_local_path(source_dir, config)
     if not base.exists():
         return []
 
@@ -92,16 +95,18 @@ def scan_directory(
         iterator = base.glob("*")
 
     for path in iterator:
-        if not path.is_file():
+        try:
+            if not path.is_file():
+                continue
+            ext = path.suffix.lower()
+            if ext not in include_extensions:
+                continue
+            if _match_exclude(path, exclude_patterns):
+                continue
+            files.append(FileInfo(path, base))
+        except OSError:
+            # 目录项不可读/损坏时跳过，不中断整个扫描
             continue
-
-        ext = path.suffix.lower()
-        if ext not in include_extensions:
-            continue
-        if _match_exclude(path, exclude_patterns):
-            continue
-
-        files.append(FileInfo(path, base))
 
     # 按路径排序
     files.sort(key=lambda f: f.rel_path)
