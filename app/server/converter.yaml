@@ -1,6 +1,5 @@
 # DocConverter 系统配置
-# 所有配置项均可通过环境变量覆盖
-# 环境变量前缀 CONVERTER_ 或 WEKNORA_
+# 所有配置项均可通过环境变量覆盖（前缀 CONVERTER_ 或 WEKNORA_）
 
 server:
   host: "0.0.0.0"
@@ -8,44 +7,105 @@ server:
 
 converter:
   upload_dir: "/data/uploads"     # 上传临时目录
-  output_dir: "/data/output"      # 输出 Markdown 目录 (保留源目录结构)
+  output_dir: "/data/output"      # 输出 Markdown 目录（保留源目录结构）
   temp_dir: "/data/tmp"           # 临时文件目录
   keep_uploaded: false            # 转换后是否保留上传文件
+  max_upload_mb: 1024             # 单文件 API 上传上限 (MB)
+  # Windows 盘符 → 本地挂载点映射（源/输出目录配置为 Windows 路径且容器内运行时）
+  # 例: {"C:": "/mnt/c", "\\\\192.168.31.169\\share": "/mnt/win"}
+  drive_map: {}
 
 scanner:
   enabled: false
-  source_dir: "/data/input"       # 源目录: 要转换的文档放在这里
+  # 源目录：可以是 Linux 路径，也可以是 Windows 路径（配合 drive_map）
+  source_dir: "C:\\Users\\Administrator\\Documents\\AI"
   recursive: true                 # 递归扫描子目录
   include_extensions:             # 要处理的文件类型
     - ".ofd"
     - ".wps"
+    - ".wpsx"
+    - ".dpsx"
     - ".docx"
     - ".xlsx"
     - ".et"
+    - ".etx"
     - ".pdf"
     - ".htm"
     - ".html"
     - ".pptx"
     - ".ppt"
     - ".dps"
+    - ".doc"
+    - ".xls"
+    - ".chm"
+    - ".eml"
+    - ".msg"
+    - ".zip"
+    - ".rar"
+    - ".7z"
+    - ".tar"
+    - ".gz"
+    - ".tgz"
+    - ".bz2"
+    - ".tbz2"
+    - ".xz"
+    - ".txz"
   exclude_patterns: ["~*", ".*", "*.tmp", "*.bak"]
   poll_interval: 60               # 扫描间隔 (秒)
 
 watcher:
   enabled: false
-  source_dir: "/data/input"
+  source_dir: "C:\\Users\\Administrator\\Documents\\AI"
   recursive: true
   debounce: 5                     # 变化去抖 (秒)
 
 weknora:
   enabled: false                  # 设置为 true 启用 WeKnora 推送
   api_url: ""                     # WeKnora API 地址 (如 http://weknora-app:18080)
-  api_key: ""                     # API Key (如有)
-  dataset_id: ""                  # 数据集 ID
+  api_key: ""                     # API Key（优先于账号密码）
+  email: ""                       # 登录邮箱（API Key 为空时使用）
+  password: ""                    # 登录密码
+  dataset_id: ""                  # 数据集/知识库 ID 或名称
   auto_push: true                 # 转换后自动推送到 WeKnora
+  push_original_on_missing: true  # 无法转换的格式推送原始文件，由 WeKnora 解析
+  push_rel_title: true            # 推送标题用相对路径（保留目录结构）
+  push_as_file: true              # 以文件方式推送（fileName 携带相对路径 → WeKnora 文件夹结构）
+  delete_replaced: true           # 内容变化时先删除旧文档再推送（file 类型不支持内容更新）
+  folder_kb_map_path: ""          # 文件夹→知识库映射文件（如 /app/config/folder_mappings.json，空=不启用）
+  auto_reparse: true              # 推送后自动触发 reparse（官方解析异步，需显式触发）
+  db_enable: false                # 直连数据库启用文档（官方无启用 API；破坏独立性，谨慎）
+  db_host: "postgres"
+  db_port: 5432
+  db_name: "weknora"
+  db_user: "postgres"
+  db_password: ""
+  max_file_size_mb: 50            # 与服务端 MAX_FILE_SIZE_MB 对齐
   delete_source_after_push: false # 推送后删除源文件
+  retry_count: 3                  # 推送失败重试次数
 
 batch:
-  workers: 2                      # 并行转换数
+  workers: 4                      # 并行转换数
   retry_count: 3                  # 失败重试次数
   retry_delay: 5                  # 重试间隔 (秒)
+
+archive:
+  seven_zip_path: "7zz"           # 7-Zip 路径（rar/7z 解压用）
+  max_depth: 3                    # 嵌套归档最大深度
+  keep_extracted: false           # 是否在输出目录保留解压出的原始文件
+  max_extract_mb: 0               # 解压配额 (MB, 0=默认 2GB，防 zip 炸弹)
+  max_extract_entries: 0          # 解压条目数配额 (0=默认 10 万)
+
+chm:
+  seven_zip_path: "7zz"           # 7-Zip 路径（CHM 解压用）
+  extract_workers: 8              # CHM 章节内 HTML→MD 并行数
+
+pdf:
+  ocr_enabled: false              # 图片型 PDF 是否启用 OCR
+  ocr_command: "tesseract"
+  ocr_lang: "chi_sim+eng"
+  ocr_dpi: 200
+
+registry:
+  backend: "json"                 # json | sqlite（sqlite 更抗崩溃，相对路径键）
+  path: "/data/registry.json"     # json 后端路径
+  sqlite_path: "/data/registry.sqlite"  # sqlite 后端路径

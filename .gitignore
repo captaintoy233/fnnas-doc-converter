@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
 .env
 *.egg-info/
 dist/
@@ -9,3 +10,7 @@ build/
 test_samples/*.docx
 test_samples/*.ofd
 test_samples/*.wps
+_ref/
+data/
+*.log
+/converter.yaml

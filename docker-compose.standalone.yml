@@ -1,0 +1,72 @@
+# DocConverter 独立部署（推荐生产方式）
+# 对接你已有的 WeKnora 部署，不捆绑 WeKnora 全家桶。
+#
+# 使用场景:
+# - WeKnora 已部署在 NAS / GPU 主机，这里只跑转换服务
+# - 源目录/输出目录来自 Windows 主机（通过 SMB/CIFS 挂载到宿主机后 bind 进容器）
+#
+# 启动:  docker compose -f docker-compose.standalone.yml up -d
+#
+# 环境变量示例 (.env):
+#   WEKNORA_URL=http://192.168.31.131:8080
+#   WEKNORA_EMAIL=admin@rag.local
+#   WEKNORA_PASSWORD=你的密码        # 或 WEKNORA_API_KEY=sk-...
+#   WEKNORA_DATASET_ID=知识库ID或名称
+#   CONVERTER_SOURCE_DIR=/data/input   # 容器内路径（宿主机路径见下方 volumes）
+#   CONVERTER_OUTPUT_DIR=/data/output
+
+services:
+  doc-converter:
+    build:
+      context: ./app/server
+      dockerfile: Dockerfile
+    image: docconverter:2.1.0
+    container_name: doc-converter
+    restart: always
+    ports:
+      - "${CONVERTER_PORT:-8080}:8080"
+    environment:
+      WEKNORA_URL: "${WEKNORA_URL:-}"
+      WEKNORA_ENABLED: "${WEKNORA_ENABLED:-true}"
+      WEKNORA_API_KEY: "${WEKNORA_API_KEY:-}"
+      WEKNORA_EMAIL: "${WEKNORA_EMAIL:-}"
+      WEKNORA_PASSWORD: "${WEKNORA_PASSWORD:-}"
+      WEKNORA_DATASET_ID: "${WEKNORA_DATASET_ID:-}"
+      WEKNORA_AUTO_PUSH: "${WEKNORA_AUTO_PUSH:-true}"
+      WEKNORA_PUSH_ORIGINAL: "${WEKNORA_PUSH_ORIGINAL:-true}"
+      WEKNORA_PUSH_REL_TITLE: "${WEKNORA_PUSH_REL_TITLE:-true}"
+      BATCH_WORKERS: "${BATCH_WORKERS:-8}"        # 利用 E5 多核
+      CONVERTER_SOURCE_DIR: "${CONVERTER_SOURCE_DIR:-/data/input}"
+      CONVERTER_OUTPUT_DIR: "${CONVERTER_OUTPUT_DIR:-/data/output}"
+      CONVERTER_REGISTRY_PATH: "/data/state/registry.json"
+      CONVERTER_WATCH_ENABLED: "${CONVERTER_WATCH_ENABLED:-false}"
+      CHM_SEVEN_ZIP_PATH: "${CHM_SEVEN_ZIP_PATH:-7zz}"
+      ARCHIVE_SEVEN_ZIP_PATH: "${ARCHIVE_SEVEN_ZIP_PATH:-7zz}"
+    volumes:
+      # Windows 目录挂载示例（宿主机先 SMB 挂载 Windows 共享到 /mnt/win-ai 等）:
+      # - /mnt/win-ai:/data/input          # C:\Users\Administrator\Documents\AI
+      # - /mnt/win-ai-out:/data/output     # C:\Users\Administrator\Documents\AI-OUT
+      # 也可以直接用 Linux 本地目录:
+      - "${HOST_INPUT_DIR:-./data/input}:/data/input"
+      - "${HOST_OUTPUT_DIR:-./data/output}:/data/output"
+      - "${HOST_UPLOAD_DIR:-./data/uploads}:/data/uploads"
+      - state_data:/data/state
+    networks:
+      - weknora-net
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8080/api/health',timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+# 对接已有 WeKnora 的网络。若 WeKnora 在别的 compose 项目，
+# 先在其 docker-compose.yml 里声明外部网络，例如:
+#   networks:
+#     weknora-net:
+#       external: true
+networks:
+  weknora-net:
+    external: true
+
+volumes:
+  state_data:

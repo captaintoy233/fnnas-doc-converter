@@ -29,7 +29,8 @@ def _poll_loop(on_new_files: Callable, stop_event: threading.Event):
     interval = config["scanner"]["poll_interval"]
 
     known = set()
-    source = Path(scanner_cfg["source_dir"])
+    from paths import to_local_path
+    source = to_local_path(scanner_cfg["source_dir"], config)
     source.mkdir(parents=True, exist_ok=True)
 
     while not stop_event.is_set():

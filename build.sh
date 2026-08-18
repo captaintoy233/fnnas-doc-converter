@@ -1,5 +1,5 @@
 #!/bin/bash
-# DocConverter v2.0 构建脚本
+# DocConverter v2.1 构建脚本
 # 在飞牛OS或任意有Docker的机器上运行
 
 set -e
@@ -7,13 +7,13 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-echo "🚀 DocConverter v2.0 Docker 构建"
+echo "🚀 DocConverter v2.1 Docker 构建"
 echo "================================"
 
 # 1. 构建转换器镜像
 echo ""
 echo "📦 [1/4] 构建转换器镜像..."
-docker build -t docconverter:2.0.0 -f app/server/Dockerfile app/server/
+docker build -t docconverter:2.1.0 -f app/server/Dockerfile app/server/
 
 # 2. 创建数据目录
 echo ""
@@ -31,7 +31,7 @@ docker run -d --name doc-converter -p 8080:8080 \
   -e WEKNORA_ENABLED=false \
   -e CONVERTER_SOURCE_DIR=/data/input \
   -e CONVERTER_OUTPUT_DIR=/data/output \
-  docconverter:2.0.0
+  docconverter:2.1.0
 
 # 等待服务启动
 echo "   等待服务就绪..."

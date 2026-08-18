@@ -1,6 +1,8 @@
-# DocConverter + WeKnora 全栈部署
+# DocConverter + WeKnora 全栈部署（一体式演示/小规模环境）
 # 使用: docker compose up -d
 # 配置环境变量: .env 文件或直接在 shell 中 export
+#
+# 若你已有独立的 WeKnora 部署（推荐生产方式），请改用 docker-compose.standalone.yml
 
 networks:
   docnet:
@@ -12,7 +14,7 @@ services:
     build:
       context: ./app/server
       dockerfile: Dockerfile
-    image: docconverter:2.0.0
+    image: docconverter:2.1.0
     container_name: doc-converter
     ports:
       - "${CONVERTER_PORT:-8080}:8080"
@@ -23,14 +25,20 @@ services:
       WEKNORA_AUTO_PUSH: "${WEKNORA_AUTO_PUSH:-true}"
       WEKNORA_DATASET_ID: "${WEKNORA_DATASET_ID:-}"
       WEKNORA_API_KEY: "${WEKNORA_API_KEY:-}"
-      BATCH_WORKERS: "${BATCH_WORKERS:-2}"
-      CONVERTER_SOURCE_DIR: "/data/input"
+      WEKNORA_EMAIL: "${WEKNORA_EMAIL:-}"
+      WEKNORA_PASSWORD: "${WEKNORA_PASSWORD:-}"
+      WEKNORA_PUSH_ORIGINAL: "${WEKNORA_PUSH_ORIGINAL:-true}"
+      WEKNORA_PUSH_REL_TITLE: "${WEKNORA_PUSH_REL_TITLE:-true}"
+      BATCH_WORKERS: "${BATCH_WORKERS:-4}"
+      CONVERTER_SOURCE_DIR: "${CONVERTER_SOURCE_DIR:-/data/input}"
       CONVERTER_OUTPUT_DIR: "/data/output"
+      CONVERTER_REGISTRY_PATH: "/data/state/registry.json"
       CONVERTER_WATCH_ENABLED: "${CONVERTER_WATCH_ENABLED:-false}"
     volumes:
       - input_data:/data/input        # 源文件放入此目录
       - output_data:/data/output      # 转换结果输出到此目录
       - upload_data:/data/uploads     # 上传临时文件
+      - state_data:/data/state        # 增量同步注册表
     networks:
       - docnet
     restart: unless-stopped
@@ -88,7 +96,7 @@ services:
     environment:
       POSTGRES_DB: weknora
       POSTGRES_USER: weknora
-      POSTGRES_PASSWORD: "${PG_PASSWORD:-weknora123}"
+      POSTGRES_PASSWORD: "${PG_PASSWORD:?请在 .env 设置 PG_PASSWORD（Postgres 口令）}"
     volumes:
       - pg_data:/var/lib/postgresql/data
     networks:
@@ -103,7 +111,7 @@ services:
   redis:
     image: hub.1panel.dev/library/redis:7.0-alpine
     container_name: weknora-redis
-    command: redis-server --requirepass "${REDIS_PASSWORD:-weknora123}"
+    command: redis-server --requirepass "${REDIS_PASSWORD:?请在 .env 设置 REDIS_PASSWORD（Redis 口令）}"
     volumes:
       - redis_data:/data
     networks:
@@ -115,11 +123,9 @@ services:
     container_name: weknora-minio
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: "${MINIO_USER:-weknora}"
-      MINIO_ROOT_PASSWORD: "${MINIO_PASSWORD:-weknora123}"
-    ports:
-      - "9000:9000"
-      - "9001:9001"
+      MINIO_ROOT_USER: "${MINIO_USER:?请在 .env 设置 MINIO_USER}"
+      MINIO_ROOT_PASSWORD: "${MINIO_PASSWORD:?请在 .env 设置 MINIO_PASSWORD}"
+    # MinIO 仅内部网络使用，不暴露宿主端口（避免公网直连）
     volumes:
       - minio_data:/data
     networks:
@@ -130,6 +136,7 @@ volumes:
   input_data:
   output_data:
   upload_data:
+  state_data:
   pg_data:
   redis_data:
   minio_data:
