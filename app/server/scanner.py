@@ -41,12 +41,25 @@ def _format_size(size: int) -> str:
         return f"{size / 1024 / 1024:.1f}MB"
 
 
-def _match_exclude(path: Path, patterns: list) -> bool:
-    """检查文件是否匹配排除规则"""
+def _match_exclude(path: Path, patterns: list, base: Path = None) -> bool:
+    """检查文件是否匹配排除规则
+
+    同时匹配文件名与相对路径中的**目录组件**，因此形如 `_*` 的规则
+    可以整体排除 `_未编目/` 这类内部目录（否则目录内文件自身不匹配）。
+    """
     name = path.name
     for pattern in patterns:
         if fnmatch.fnmatch(name, pattern):
             return True
+    if base is not None:
+        try:
+            rel = path.relative_to(base)
+        except ValueError:
+            return False
+        for part in rel.parts[:-1]:
+            for pattern in patterns:
+                if fnmatch.fnmatch(part, pattern):
+                    return True
     return False
 
 
@@ -101,7 +114,7 @@ def scan_directory(
             ext = path.suffix.lower()
             if ext not in include_extensions:
                 continue
-            if _match_exclude(path, exclude_patterns):
+            if _match_exclude(path, exclude_patterns, base):
                 continue
             files.append(FileInfo(path, base))
         except OSError:

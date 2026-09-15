@@ -2,11 +2,27 @@
 
 OLE2 复合文档，正文位于 WordDocument 流。优先按 FIB 的 fcMin/fcMac
 精确截取正文（UTF-16LE），解析失败时回退到旧版启发式提取。
+
+架构改进（v2 - Document Model）:
+- 先解析为统一 Document Model，再通过共享序列化器输出 Markdown
+- 提取的文本行映射为 Paragraph blocks
+- OLE 打开失败时抛出 MalformedDocumentError
+
+向后兼容:
+- convert() 方法保持原有签名和返回类型
+- 新增 convert_to_document() 返回 Document Model
 """
 import olefile
 import re
 import struct
 from . import BaseConverter
+
+# Document Model 导入
+from model.document import Document
+from model.block import Paragraph
+from model.inline import Text
+from render.markdown import document_to_markdown
+from errors import MalformedDocumentError
 
 
 class WPSConverter(BaseConverter):
@@ -44,10 +60,22 @@ class WPSConverter(BaseConverter):
         text = text[start.start():] if start else text
         return text
 
-    def convert(self, file_path: str, **kwargs) -> str:
-        ole = olefile.OleFileIO(file_path)
+    def _extract_text(self, file_path: str) -> str:
+        """从 WPS 文件中提取纯文本"""
+        try:
+            ole = olefile.OleFileIO(file_path)
+        except Exception as e:
+            raise MalformedDocumentError(
+                f"Failed to open WPS OLE file: {e}",
+                file_path=file_path
+            ) from e
         try:
             wd = ole.openstream('WordDocument').read()
+        except Exception as e:
+            raise MalformedDocumentError(
+                f"Failed to read WordDocument stream: {e}",
+                file_path=file_path
+            ) from e
         finally:
             ole.close()
 
@@ -61,3 +89,21 @@ class WPSConverter(BaseConverter):
         text = re.sub(r'[ \t]+\n', '\n', text)
         text = re.sub(r'\n{3,}', '\n\n', text)
         return text.strip()
+
+    def convert_to_document(self, file_path: str, **kwargs) -> Document:
+        """转换为统一文档模型"""
+        text = self._extract_text(file_path)
+        doc = Document()
+
+        # Split text into lines and create Paragraph blocks
+        for line in text.split('\n'):
+            line = line.strip()
+            if line:
+                doc.add_block(Paragraph(children=[Text(line)]))
+
+        return doc
+
+    def convert(self, file_path: str, **kwargs) -> str:
+        """转换为 Markdown 字符串（向后兼容接口）"""
+        doc = self.convert_to_document(file_path, **kwargs)
+        return document_to_markdown(doc)

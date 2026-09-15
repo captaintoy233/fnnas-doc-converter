@@ -1,9 +1,10 @@
 """占位转换器：需要系统工具 (LibreOffice/Tesseract) 或暂未实现的格式。"""
 from . import BaseConverter
+from errors import UnsupportedFormatError
 
 
 class PlaceholderConverter(BaseConverter):
-    """占位：返回提示信息"""
+    """占位：返回提示信息或抛出结构化异常"""
 
     def __init__(self, name: str, exts: list, msg: str = ""):
         self._name = name
@@ -28,3 +29,11 @@ class PlaceholderConverter(BaseConverter):
 
     def convert(self, file_path: str, **kwargs) -> str:
         return self._msg
+
+    def convert_to_document(self, file_path: str, **kwargs):
+        """占位转换器无法产出 Document Model，抛出结构化异常"""
+        raise UnsupportedFormatError(
+            f"Format '{self._name}' is not supported for conversion",
+            format_name=self._name,
+            file_path=file_path,
+        )
