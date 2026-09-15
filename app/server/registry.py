@@ -15,6 +15,11 @@ import threading
 import time
 from pathlib import Path
 
+try:
+    from config import RENDER_VERSION
+except Exception:  # pragma: no cover - 独立使用注册表时无 config
+    RENDER_VERSION = ""
+
 
 class SyncRegistry:
     """基于 JSON 文件的增量注册表（线程安全）"""
@@ -81,18 +86,21 @@ class SyncRegistry:
             return dict(self._data.get(str(file_path), {}))
 
     def needs_convert(self, file_path: str, source_hash: str = None) -> bool:
-        """是否需要（重新）转换：无记录或源文件指纹变化"""
+        """是否需要（重新）转换：无记录、源文件指纹变化，或渲染版本变化"""
         rec = self.get(file_path)
         if not rec:
             return True
         if source_hash is None:
             source_hash = self.sha256_of_file(file_path)
-        return rec.get("source_hash") != source_hash
+        if rec.get("source_hash") != source_hash:
+            return True
+        return rec.get("render_version") != RENDER_VERSION
 
     def record(self, file_path: str, source_hash: str, output_rel: str = "",
                converted_hash: str = "", status: str = "converted",
                pushed: bool = False, weknora_doc_id: str = "",
-               error: str = "", output_files: list = None):
+               error: str = "", output_files: list = None,
+               render_version: str = None):
         """记录一次转换结果"""
         out_files = output_files if output_files else ([output_rel] if output_rel else [])
         rec = {
@@ -105,6 +113,7 @@ class SyncRegistry:
             "weknora_doc_id": weknora_doc_id,
             "output_docs": {},          # {输出相对路径: WeKnora doc_id}（更新语义用）
             "error": error,
+            "render_version": RENDER_VERSION if render_version is None else render_version,
             "converted_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
         # 保留旧 output_docs（增量更新不丢失已推送文档的 doc_id）
@@ -181,7 +190,8 @@ class SqliteSyncRegistry:
         output_docs     TEXT,
         error           TEXT,
         converted_at    TEXT,
-        pushed_at       TEXT
+        pushed_at       TEXT,
+        render_version  TEXT
     )"""
 
     def __init__(self, db_path: str = "/data/registry.sqlite", source_dir: str = ""):
@@ -201,6 +211,7 @@ class SqliteSyncRegistry:
                 "pushed": "INTEGER DEFAULT 0", "weknora_doc_id": "TEXT",
                 "output_docs": "TEXT", "error": "TEXT",
                 "converted_at": "TEXT", "pushed_at": "TEXT",
+                "render_version": "TEXT",
             }
             for col, ctype in col_types.items():
                 if col not in existing:
@@ -225,7 +236,8 @@ class SqliteSyncRegistry:
 
     _COLS = ("file_path", "source_hash", "output_rel", "output_files",
              "converted_hash", "status", "pushed", "weknora_doc_id",
-             "output_docs", "error", "converted_at", "pushed_at")
+             "output_docs", "error", "converted_at", "pushed_at",
+             "render_version")
     _COL_SQL = ", ".join(_COLS)
 
     def _row_to_dict(self, row) -> dict:
@@ -260,7 +272,9 @@ class SqliteSyncRegistry:
             return True
         if source_hash is None:
             source_hash = self.sha256_of_file(file_path)
-        return rec.get("source_hash") != source_hash
+        if rec.get("source_hash") != source_hash:
+            return True
+        return rec.get("render_version") != RENDER_VERSION
 
     @staticmethod
     def sha256_of_file(file_path: str) -> str:
@@ -273,7 +287,8 @@ class SqliteSyncRegistry:
     def record(self, file_path: str, source_hash: str, output_rel: str = "",
                converted_hash: str = "", status: str = "converted",
                pushed: bool = False, weknora_doc_id: str = "",
-               error: str = "", output_files: list = None):
+               error: str = "", output_files: list = None,
+               render_version: str = None):
         out_files = output_files if output_files else ([output_rel] if output_rel else [])
         # 保留旧 output_docs（增量更新不丢失已推送文档的 doc_id）
         old = self.get(file_path)
@@ -284,8 +299,8 @@ class SqliteSyncRegistry:
                 conn.execute(
                     """INSERT INTO registry (file_path, source_hash, output_rel, output_files,
                        converted_hash, status, pushed, weknora_doc_id, output_docs,
-                       error, converted_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                       error, converted_at, render_version)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                        ON CONFLICT(file_path) DO UPDATE SET
                          source_hash=excluded.source_hash,
                          output_rel=excluded.output_rel,
@@ -296,13 +311,15 @@ class SqliteSyncRegistry:
                          weknora_doc_id=excluded.weknora_doc_id,
                          output_docs=excluded.output_docs,
                          error=excluded.error,
-                         converted_at=excluded.converted_at""",
+                         converted_at=excluded.converted_at,
+                         render_version=excluded.render_version""",
                     (self._key(file_path), source_hash, output_rel,
                      json.dumps(out_files, ensure_ascii=False),
                      converted_hash, status, 1 if pushed else 0,
                      weknora_doc_id,
                      json.dumps(old_docs, ensure_ascii=False),
-                     error, time.strftime("%Y-%m-%dT%H:%M:%S")))
+                     error, time.strftime("%Y-%m-%dT%H:%M:%S"),
+                     RENDER_VERSION if render_version is None else render_version))
                 conn.commit()
             finally:
                 conn.close()
