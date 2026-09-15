@@ -37,9 +37,14 @@ scanner:
     - ".dps"
     - ".doc"
     - ".xls"
+    - ".gd"                       # 加密公文（无法解密时给出提示）
+    - ".rtf"
     - ".chm"
     - ".eml"
     - ".msg"
+    - ".md"                       # 既有 Markdown 直通（不改动内容）
+    - ".txt"
+    - ".csv"
     - ".zip"
     - ".rar"
     - ".7z"
@@ -50,7 +55,11 @@ scanner:
     - ".tbz2"
     - ".xz"
     - ".txz"
-  exclude_patterns: ["~*", ".*", "*.tmp", "*.bak"]
+  # 注意：本列表会**覆盖** config.py 的代码默认值。新增转换器时两边都要加，
+  # 否则转换器已注册但文件永远扫不到（曾漏掉 .md/.txt/.csv/.rtf/.gd）。
+  # '_*' 排除导出产物的内部文件（_manifest.json / _index.md / _废止清单.md /
+  # _未编目/ 等），避免被当成知识文档推送。
+  exclude_patterns: ["~*", ".*", "_*", "*.tmp", "*.bak"]
   poll_interval: 60               # 扫描间隔 (秒)
 
 watcher:
