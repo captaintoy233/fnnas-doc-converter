@@ -16,6 +16,11 @@ from scanner import FileInfo
 from converters import registry
 from sniffer import sniff_format
 from registry import get_registry
+
+try:
+    from config import RENDER_VERSION
+except Exception:  # pragma: no cover
+    RENDER_VERSION = ""
 from paths import to_local_path
 
 # 任务状态
@@ -623,14 +628,18 @@ def _convert_single(task: BatchTask, output_dir: Path, config: dict) -> BatchTas
 
         task.converter = converter.display_name
 
-        # 增量跳过：源文件指纹未变化且已有输出
         registry = get_registry()
         source_hash = registry.sha256_of_file(str(path))
         task.source_hash = source_hash
         rel = task.file_info.rel_path
         md_rel = str(Path(rel).with_suffix(".md"))
         rec = registry.get(str(path))
-        if rec and rec.get("source_hash") == source_hash and rec.get("status") == "converted":
+        # 增量跳过：源文件指纹与渲染版本都未变化且已有输出。
+        # 渲染版本必须一起比对：转换逻辑升级后源文件哈希没变，
+        # 若只看哈希，老产物会被永久跳过（v2.2.0 修丢图就靠它触发重转）。
+        if (rec and rec.get("source_hash") == source_hash
+                and rec.get("status") == "converted"
+                and rec.get("render_version") == RENDER_VERSION):
             # 多输出源（CHM 章节/压缩包）按 output_files 全部存在才跳过
             out_files = rec.get("output_files") or [md_rel]
             all_exist = True

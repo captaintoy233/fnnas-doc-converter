@@ -8,6 +8,11 @@ from dataclasses import dataclass, field, asdict
 from typing import Optional
 
 APP_VERSION = "2.2.0"
+# 渲染版本：**仅当转换逻辑变更会改变输出内容时**递增（与 APP_VERSION 解耦）。
+# 注册表会记录每次转换时的该值，不一致即重新转换。
+# 没有它的话，升级后源文件哈希没变，老输出会被增量永久跳过——
+# v2.2.0 修复的丢图问题正是这种情况：代码换了但产物没重生成。
+RENDER_VERSION = "2.2.0"
 APP_NAME = "DocConverter"
 
 CONFIG_PATHS = [
