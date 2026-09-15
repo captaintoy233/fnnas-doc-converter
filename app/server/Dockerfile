@@ -24,7 +24,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # 复制服务代码和配置
 COPY converters/ /app/converters/
 COPY main.py cli.py config.py scanner.py batch.py watcher.py \
-     weknora_client.py sniffer.py registry.py paths.py extract.py /app/
+     weknora_client.py sniffer.py registry.py paths.py extract.py ocr.py /app/
 COPY converter.yaml /app/config/converter.yaml
 
 # 创建数据目录

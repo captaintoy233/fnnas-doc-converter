@@ -7,7 +7,7 @@ from pathlib import Path
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
-APP_VERSION = "2.1.1"
+APP_VERSION = "2.2.0"
 APP_NAME = "DocConverter"
 
 CONFIG_PATHS = [
@@ -30,6 +30,8 @@ DEFAULT_CONFIG = {
         "output_dir": "/data/output",
         "temp_dir": "/data/tmp",
         "keep_uploaded": False,
+        # 输出镜像目录：转换产物额外同步一份到此目录（空 = 不镜像）
+        "output_mirror": "",
         "max_upload_mb": 1024,        # 单文件 API 上传上限 (MB)
         # Windows 盘符/共享 → 本地挂载点映射（容器内运行时配置）
         # 例: {"C:": "/mnt/c", "\\\\nas": "/mnt/nas"}
@@ -42,11 +44,14 @@ DEFAULT_CONFIG = {
         "include_extensions": [
             ".ofd", ".wps", ".wpsx", ".dpsx", ".docx", ".xlsx", ".et", ".etx",
             ".pdf", ".htm", ".html", ".pptx", ".ppt", ".dps",
-            ".doc", ".xls", ".chm",
+            ".doc", ".xls", ".gd", ".rtf", ".chm",
             ".eml", ".msg",
+            ".md", ".txt", ".csv",
             ".zip", ".rar", ".7z", ".tar", ".gz", ".tgz", ".bz2", ".tbz2", ".xz", ".txz",
         ],
-        "exclude_patterns": ["~*", ".*", "*.tmp", "*.bak"],
+        # '_*' 用于排除导出产物的内部文件/目录（_manifest.json、_index.md、
+        # _废止清单.md、_未编目/ 等），避免被当作知识文档推送
+        "exclude_patterns": ["~*", ".*", "_*", "*.tmp", "*.bak"],
         "poll_interval": 60,
     },
     "watcher": {
@@ -90,6 +95,8 @@ DEFAULT_CONFIG = {
     },
     "archive": {
         "seven_zip_path": "7zz",
+        # 源文件消失时移入的归档目录（空 = 不归档，仅从知识库删除）
+        "dir": "",
         "max_depth": 3,               # 嵌套归档最大深度
         "keep_extracted": False,       # 是否在输出目录保留解压出的原始文件
         "max_extract_mb": 0,          # 解压配额 (MB, 0=默认 2GB)
@@ -98,6 +105,19 @@ DEFAULT_CONFIG = {
     "chm": {
         "seven_zip_path": "7zz",
         "extract_workers": 8,
+        # 输出布局: tree = 按 .hhc 索引层级建文件夹、每文档一个 MD（推荐，利于知识库）
+        #           chapter = 每个顶层章节合并为一个 MD（旧行为）
+        "output_layout": "tree",
+        # 是否在 MD 头部写入 YAML 元数据（title/status/toc_path/content_hash 等）
+        "front_matter": True,
+        # 批处理共用输出根目录时，以 CHM 名建一层命名空间目录，避免多本手册混树
+        "namespace_output": True,
+        # 跳过 Word/Excel 导出 HTML 的空壳辅助页（header/tabstrip/tabscript 等）
+        "skip_scaffold": True,
+        # 渲染并行方式：文档数 >= mp_threshold 时用多进程（绕开 GIL，
+        # 实测 4471 篇 127s vs 多线程 25 分钟），否则用线程
+        "render_processes": True,
+        "mp_threshold": 50,
     },
     "pdf": {
         "ocr_enabled": False,
@@ -105,11 +125,38 @@ DEFAULT_CONFIG = {
         "ocr_lang": "chi_sim+eng",
         "ocr_dpi": 200,
     },
+    "libreoffice": {
+        "soffice_path": "",             # 空=自动检测；指定路径如 /usr/bin/soffice
+    },
+    "ocr": {
+        "enabled": False,               # 是否对图片做 OCR 并把文字注入 MD
+        "backend": "rapidocr",          # 纯 CPU / ONNX Runtime
+        "cache_dir": "~/.cache/docconverter/ocr",
+        "intra_op_num_threads": 2,      # 进程数 × 该值 ≈ 物理核数
+        "tile_threshold": 960,          # 最长边超过则分块（避免缩放漏检小字）
+        "tile_size": 960,
+        "tile_overlap": 96,
+        "min_score": 0.5,
+        "min_image_side": 32,           # 任一边小于该值的碎片图跳过
+        "max_side_len": 2000,
+        "det_limit_side_len": 736,
+        "label": "图片文字",
+        "placeholder_missing": True,    # 图片缺失时写占位文本而非死引用
+        # 常驻服务（容器批处理）无独立 OCR 预处理阶段，需开启内联回退
+        "inline_fallback": False,
+    },
+    "htm": {
+        # HTML 图片处理：留空则跟随 ocr.enabled（启用 OCR 时用 link）
+        "image_mode": "",               # none | link | base64
+    },
     "registry": {
         "backend": "json",            # json | sqlite
         "path": "/data/registry.json",
         "sqlite_path": "/data/registry.sqlite",
         "prune_on_batch": False,      # 批次前清理已删源文件记录（仅在批次恒为全量源目录扫描时开启）
+        # 源文件消失时：从知识库删除对应文档（+ 可选归档源文件）。
+        # 仅在全量扫描批次中生效，避免把"部分批次的缺席"误判为"已删除"。
+        "handle_missing": False,
     },
 }
 
@@ -122,6 +169,7 @@ ENV_MAP = [
     ("CONVERTER_UPLOAD_DIR", ["converter", "upload_dir"], str),
     ("CONVERTER_TEMP_DIR", ["converter", "temp_dir"], str),
     ("CONVERTER_KEEP_UPLOADED", ["converter", "keep_uploaded"], bool),
+    ("CONVERTER_OUTPUT_MIRROR", ["converter", "output_mirror"], str),
     ("CONVERTER_MAX_UPLOAD_MB", ["converter", "max_upload_mb"], int),
     ("CONVERTER_SOURCE_DIR", ["scanner", "source_dir"], str),
     ("CONVERTER_RECURSIVE", ["scanner", "recursive"], bool),
@@ -163,10 +211,26 @@ ENV_MAP = [
     ("ARCHIVE_KEEP_EXTRACTED", ["archive", "keep_extracted"], bool),
     ("CHM_SEVEN_ZIP_PATH", ["chm", "seven_zip_path"], str),
     ("CHM_EXTRACT_WORKERS", ["chm", "extract_workers"], int),
+    ("CHM_OUTPUT_LAYOUT", ["chm", "output_layout"], str),
+    ("CHM_FRONT_MATTER", ["chm", "front_matter"], bool),
+    ("CHM_NAMESPACE_OUTPUT", ["chm", "namespace_output"], bool),
     ("PDF_OCR_ENABLED", ["pdf", "ocr_enabled"], bool),
     ("PDF_OCR_COMMAND", ["pdf", "ocr_command"], str),
     ("PDF_OCR_LANG", ["pdf", "ocr_lang"], str),
+    ("LIBREOFFICE_SOFFICE_PATH", ["libreoffice", "soffice_path"], str),
+    ("OCR_ENABLED", ["ocr", "enabled"], bool),
+    ("OCR_BACKEND", ["ocr", "backend"], str),
+    ("OCR_CACHE_DIR", ["ocr", "cache_dir"], str),
+    ("OCR_THREADS", ["ocr", "intra_op_num_threads"], int),
+    ("OCR_TILE_THRESHOLD", ["ocr", "tile_threshold"], int),
+    ("OCR_MIN_IMAGE_SIDE", ["ocr", "min_image_side"], int),
+    ("OCR_INLINE_FALLBACK", ["ocr", "inline_fallback"], bool),
     ("CONVERTER_REGISTRY_PATH", ["registry", "path"], str),
+    ("REGISTRY_HANDLE_MISSING", ["registry", "handle_missing"], bool),
+    ("ARCHIVE_DIR", ["archive", "dir"], str),
+    ("CHM_SKIP_SCAFFOLD", ["chm", "skip_scaffold"], bool),
+    ("CHM_RENDER_PROCESSES", ["chm", "render_processes"], bool),
+    ("CHM_MP_THRESHOLD", ["chm", "mp_threshold"], int),
 ]
 
 
