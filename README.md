@@ -182,11 +182,156 @@ python cli.py test-weknora            # 测试连接
 | XLSX / ET / ETX | openpyxl / xlrd | 表格转 MD、数值/日期格式化、`\|` 转义 |
 | PDF | PyMuPDF | 文字型直接提取；图片型可选 Tesseract OCR |
 | PPTX / DPSX | python-pptx | 每页文本、表格、组合图形、演讲备注 |
-| HTML | bs4 + markdownify | 编码自动检测（GBK/UTF-8） |
-| CHM | 7zz + bs4 | 解压、`.hhc` 章节分组、按章节输出 MD；超大页面走快速文本提取 |
+| HTML | bs4 + markdownify | 编码自动检测（GBK/UTF-8）；带图文档支持图片落盘与 OCR 文字注入 |
+| CHM | 7zz + bs4 | 解压、`.hhc` 索引层级建文件夹、每文档一个 MD（增量可重跑）；超大页面走快速文本提取 |
 | EML / MSG | email / extract-msg | 邮件头+正文+附件合并为单 MD |
 | zip/rar/7z/tar | zipfile/tarfile/7zz | 解压后逐文件转换，保留内部结构 |
-| PPT/DPS/DOC/XLS(旧版) | 占位 | 无法转换时回退推送原始文件到 WeKnora |
+| DOC / XLS（旧版） | olefile / xlrd（+ LibreOffice 可选） | OLE2 正文提取、xlrd 表格；装了 soffice 时优先走 LibreOffice |
+| RTF | 纯 Python 状态机 | 跳过字体/样式表，提取正文（支持 GBK/Unicode 转义） |
+| GD（金山加密公文） | 提示占位 | 内容加密，需 WPS 解密后另存再转换 |
+| PPT/DPS（旧版） | 提示占位 | 无法转换时回退推送原始文件到 WeKnora |
+
+## 纯文本类格式（.md / .txt / .csv）
+
+- **`.md` 原样透传**：已是 Markdown，经解析器再走一遍只会损伤格式（列表、表格、
+  代码块），故做字节级透传
+- **`.txt`** ：按行成段，换行归一化
+- **`.csv`** ：转为 GitHub 风格 Markdown 表格，正确处理引号包裹、内嵌逗号与竖线转义
+
+输出命名：`.md` 保持原名（`报告.md`），`.txt`/`.csv` 保留原扩展名
+（`报告.txt.md`）——否则同名的不同格式会互相覆盖（实测踩到过）。
+
+## 输出镜像
+
+转换产物额外同步一份到镜像目录，便于备份或二次利用：
+
+```bash
+CONVERTER_OUTPUT_MIRROR=/output-mirror ...
+```
+
+## CHM 渲染并行（多进程）
+
+HTML→MD（BeautifulSoup + markdownify）是纯 Python 的 CPU 密集任务，
+**线程受 GIL 限制无法并行**。故文档数达到阈值时自动改用多进程：
+
+| 方式 | 4471 篇耗时 |
+|---|---|
+| ThreadPoolExecutor | 约 25 分钟（仅 1 核） |
+| **ProcessPoolExecutor** | **2.7 分钟**（实测，含解压） |
+
+配置：`chm.render_processes`（默认 true）、`chm.mp_threshold`（默认 50，
+低于阈值用线程以省去进程启动开销）。
+
+## 源文件消失处理（知识库一致性）
+
+源文件从源目录移除后，若不在知识库中删除对应文档，已下线/废止内容会继续被检索到。
+开启后，批次启动时对比「注册表记录」与「本次扫描结果」：
+
+```
+缺失的源文件 → 从 WeKnora 删除其产出的全部文档（一个源文件可能产出多篇）
+             → 源文件移入 archive.dir（若文件仍在磁盘上）
+             → 清理注册表记录
+```
+
+```bash
+REGISTRY_HANDLE_MISSING=true ARCHIVE_DIR=/archive ...
+```
+
+安全护栏：
+
+- **仅"默认源目录的全量扫描"批次**会执行；指定 `source_dir` 的局部扫描、
+  watcher 的新增文件批次都不会触发（局部视图里"缺席"不等于"已删除"）
+- **扫描结果为 0 条时不执行**（疑似挂载失败），避免误删整个知识库
+- 单条失败不中断整批，处理结果通过 `/api/batch/status` 的 `missing_sources` 上报
+- 默认关闭（`registry.handle_missing`），需显式开启
+
+## 空壳辅助页过滤
+
+Word/Excel 导出 HTML 时会生成 `header.htm` / `tabstrip.htm` / `tabscript.htm`
+等无内容的骨架页，入库即噪声。CHM 转换默认跳过它们（`chm.skip_scaffold`）。
+
+注意：**只按精确文件名过滤**，不做模式匹配——实测 `sheet0XX.htm` / `file0XXX.htm`
+含真实表格内容（如"附表2-1：…"），按模式一概过滤会丢失正文。
+
+## 图片 OCR（纯 CPU，让图片里的文字进入知识库）
+
+大量制度文件的正文其实是**图片**（扫描页、界面截图、流程图），只转文本等于内容全丢。
+启用 OCR 后，图片中的文字会被提取并作为引用块注入 MD，图片本身也复制到文档旁。
+
+```bash
+# 依赖（无头环境必须用 headless 版 OpenCV，否则缺 libGL.so.1 直接报错）
+pip install rapidocr onnxruntime opencv-python-headless
+
+# 批处理管线：开启后 HTML/CHM 自动「图片落盘 + OCR 注入」
+OCR_ENABLED=true CONVERTER_SOURCE_DIR=/data/input python3 -m app.server.main
+```
+
+要点：
+
+- **分块而非缩放**：RapidOCR 对超长边图片会整体缩放，小字直接漏检
+  （实测 11366×6734 总图默认 0 块，分块后 870 块）。最长边超过
+  `ocr.tile_threshold`（默认 960）的图自动分块 + 重叠去重。
+- **内容哈希缓存**：按图片 SHA-1 缓存结果，手册/资料更新后未变的图片无需重复识别。
+- **小图跳过**：任一边小于 `ocr.min_image_side`（默认 32）的碎片/装饰图直接跳过。
+- **缺图占位**：引用存在但图片缺失时写入 `（原图缺失：xxx.png）`，避免知识库留下死引用。
+- **并行度**：ONNX Runtime 单进程已能吃满多核，多进程几乎不加速；
+  建议 `进程数 × 线程数 ≈ 物理核数`（实测 3 进程×2 线程最优）。
+- **能力边界**：只能拿到图中的文字（流程图的节点文字可以，**连线/分支逻辑拿不到**；
+  复杂表格会变成扁平文本）。需要结构语义时需另配 VLM 方案。
+
+实测（河南信贷手册 2026-09 版，3904 张图，Xeon D-1581 6 核）：
+
+| 项目 | 结果 |
+|---|---|
+| 全量 OCR | 3872 张 / 63 分钟 / 提取 525,701 字 / 失败 0 |
+| 注入 MD | 2569 个文本块 / 689,108 字 / 198 篇文档 |
+| 单篇增益示例 | ECDS 操作手册：7,867 字 → 22,836 字（**+14,017 字**） |
+| 增量重跑 | 12.9 秒（4519 篇全跳过、0 张重识别） |
+
+
+
+CHM 手册常持续更新（新增文件、旧文件转为废止），因此提供按索引结构输出、
+可增量重跑的导出脚本：
+
+```bash
+python3 scripts/export_chm.py \
+  "/mnt/bak/AI/政策制度/河南信贷手册/河南信贷手册20260911.CHM" \
+  "/mnt/bak/AI-OUT/河南信贷手册" \
+  --workers 8
+```
+
+输出结构（与 `.hhc` 索引层级一致）：
+
+```
+河南信贷手册/
+├── _manifest.json      全量清单（文档→元数据，增量比对基准）
+├── _sync_report.json   新增/变更/删除明细（供推送管线 push/delete）
+├── _index.md           全量目录索引（带相对链接）
+├── _废止清单.md         已废止文档清单
+├── 01.外部规章/
+│   ├── 01.外部规章.md
+│   └── 人民银行/<文档>.md
+├── 25.已废止/<文档>.md
+└── _未编目/             .hhc 未收录的孤儿页
+```
+
+要点：
+
+- **元数据**：每个 MD 头部带 YAML front-matter（`title` / `status` / `toc_path` /
+  `source_chm` / `source_files` / `content_hash`），便于入库后按状态过滤。
+- **废止识别**：仅按“祖先目录名”判定（如 `25.已废止/`），不会把标题含
+  “关于废止……的决定”这类现行文件误判；废止文档正文顶部另有警示横幅。
+- **增量重跑**：以「源文件内容哈希 + 输出指纹」判定，源文件未变则跳过渲染，
+  实测 4519 篇的二次运行约 11 秒（全量约 2 分钟）。
+- **过期处理**：索引中已消失的 MD 会在 `_sync_report.json` 的 `deleted` 中列出，
+  默认不物理删除；确认后可加 `--prune` 清理（从文件系统推导，能自愈历史遗留）。
+- **链接重写**：CHM 内部 `.htm` 链接自动改写为对应 `.md` 相对路径。
+- **输出命名空间**：批处理管线里多个源文件共用输出根目录，CHM 默认以文件名建一层
+  命名空间（`<CHM名>/01.外部规章/...`），避免多本手册混进同一棵树（`chm.namespace_output`，
+  默认 true）；独立导出脚本的输出根目录本身是专用的，不受影响。
+- **常用参数**：`--force` 全量重转、`--reuse-extract DIR` 复用解压目录跳过 7z、
+  `--with-assets` 一并复制 `*.files` 图片资源（体积大，默认关闭）。
+- **推送到 WeKnora 时**：建议将 `_*` 加入扫描排除规则，避免把清单/索引当知识入库。
 
 ## API
 

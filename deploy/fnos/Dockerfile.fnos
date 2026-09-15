@@ -1,0 +1,40 @@
+# DocConverter（仓库版）— FNOS 并行验证镜像
+# 目的：与现有 v3 服务并行运行，验证通过后再切换
+FROM python:3.11-slim
+
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+
+# 国内 apt 镜像 + 基础依赖
+# libgomp1: PyMuPDF；fonts-noto-cjk: PDF 中文渲染
+RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
+       fonts-noto-cjk procps libgomp1 \
+       libxcb1 libglib2.0-0 libsm6 libxext6 libxrender1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Python 依赖（含 OCR：rapidocr + onnxruntime + opencv-python-headless）
+# 注意必须是 headless 版 OpenCV，否则无头环境缺 libGL.so.1 会直接报错
+COPY requirements.txt /app/requirements.txt
+# rapidocr 硬依赖 opencv_python（非 headless），会覆盖 headless 版并引入
+# libGL 等 GUI 依赖；此处安装后强制移除，只保留 headless
+RUN pip install --no-cache-dir -r /app/requirements.txt \
+        -i https://pypi.tuna.tsinghua.edu.cn/simple \
+    && pip uninstall -y opencv-python \
+    && pip install --no-cache-dir --force-reinstall --no-deps opencv-python-headless \
+        -i https://pypi.tuna.tsinghua.edu.cn/simple \
+    && python3 -c "import cv2; print('cv2(headless)', cv2.__version__)"
+
+# 服务代码
+COPY . /app/
+
+# 7zz（CHM / 压缩包解压）
+COPY 7zz /usr/local/bin/7zz
+RUN chmod +x /usr/local/bin/7zz
+
+RUN mkdir -p /data/uploads /data/output /data/input /data/tmp /data/config
+
+EXPOSE 8080
+CMD ["python3", "-u", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]

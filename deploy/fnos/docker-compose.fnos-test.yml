@@ -1,0 +1,43 @@
+# 仓库版 DocConverter —— FNOS 并行验证用（不影响现有 v3 服务）
+networks:
+  weknora-net:
+    external: true
+
+services:
+  docconverter-repo:
+    image: docconverter:repo
+    container_name: rag-docconverter-repo
+    mem_limit: 6144m
+    restart: "no"
+    ports:
+      - "127.0.0.1:8901:8080"
+    environment:
+      CONVERTER_SOURCE_DIR: /source-docs
+      CONVERTER_OUTPUT_DIR: /data/output
+      CONVERTER_UPLOAD_DIR: /data/uploads
+      CONVERTER_TEMP_DIR: /data/tmp
+      CONVERTER_REGISTRY_PATH: /data/registry.json
+      CONVERTER_CONFIG_FILE: /data/config/test-converter.yaml
+      # OCR：容器内无独立预处理阶段，开启内联回退
+      OCR_ENABLED: "true"
+      OCR_INLINE_FALLBACK: "true"
+      OCR_CACHE_DIR: /ocr-cache
+      OCR_THREADS: "2"
+      # CHM：命名空间 + 跳过空壳辅助页
+      CHM_NAMESPACE_OUTPUT: "true"
+      CHM_SKIP_SCAFFOLD: "true"
+      CHM_EXTRACT_WORKERS: "4"
+      # 源文件消失处理：从知识库删除 + 归档源文件
+      REGISTRY_HANDLE_MISSING: "true"
+      ARCHIVE_DIR: /archive
+      # 验证阶段不推送，避免与线上重复入库
+      WEKNORA_ENABLED: "false"
+      BATCH_WORKERS: "2"
+    volumes:
+      # 需可写：源文件消失时要移入归档目录
+      - /vol1/docker/docconverter-repo/test-input:/source-docs
+      - /vol1/docker/docconverter-repo/archive:/archive
+      - /vol1/docker/docconverter-repo/data:/data
+      - /vol1/docker/docconverter-repo/ocr-cache:/ocr-cache
+    networks:
+      - weknora-net

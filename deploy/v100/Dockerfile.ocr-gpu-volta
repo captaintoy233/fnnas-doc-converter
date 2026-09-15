@@ -1,0 +1,25 @@
+# GPU OCR（Volta 专用组合）：ORT 1.18 + CUDA 11.8 + cuDNN 8
+# 依据：该 ORT wheel 链接的是 CUDA 11 的 soname（libcublasLt.so.11），
+# 且 cuDNN 8 走旧 API，避开 V100(SM70) 上的 CUDNN_FE 失败。
+FROM python:3.11-slim
+
+RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
+       libxcb1 libglib2.0-0 libsm6 libxext6 libxrender1 libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir \
+       "onnxruntime-gpu==1.18.1" \
+       rapidocr \
+       nvidia-cudnn-cu11==8.9.6.50 \
+       nvidia-cuda-runtime-cu11 \
+       nvidia-cublas-cu11 \
+       nvidia-curand-cu11 \
+       nvidia-cufft-cu11 \
+       nvidia-cuda-nvrtc-cu11 \
+    -i https://pypi.tuna.tsinghua.edu.cn/simple \
+    && pip uninstall -y opencv-python \
+    && pip install --no-cache-dir --force-reinstall --no-deps opencv-python-headless \
+       -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+ENV LD_LIBRARY_PATH=/usr/local/lib/python3.11/site-packages/nvidia/cublas/lib:/usr/local/lib/python3.11/site-packages/nvidia/cuda_runtime/lib:/usr/local/lib/python3.11/site-packages/nvidia/cudnn/lib:/usr/local/lib/python3.11/site-packages/nvidia/curand/lib:/usr/local/lib/python3.11/site-packages/nvidia/cufft/lib:/usr/local/lib/python3.11/site-packages/nvidia/cuda_nvrtc/lib

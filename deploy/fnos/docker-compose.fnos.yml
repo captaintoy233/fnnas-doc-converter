@@ -1,0 +1,67 @@
+# DocConverter（仓库版）—— FNOS 部署配置
+#
+# 构建（注意用 -f 指定独立 Dockerfile，避免源码解包覆盖）：
+#   cd /vol1/projects/docconverter-repo
+#   docker build -f Dockerfile.fnos \
+#     --build-arg HTTP_PROXY=http://172.17.0.1:7890 \
+#     --build-arg HTTPS_PROXY=http://172.17.0.1:7890 -t docconverter:repo .
+#
+# 启动：
+#   cd /vol1/projects/custom-config
+#   docker compose -f docker-compose.repo.yml up -d
+networks:
+  weknora-net:
+    external: true
+
+services:
+  docconverter:
+    image: docconverter:repo
+    container_name: rag-docconverter-repo
+    mem_limit: 6144m
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8901:8080"
+    environment:
+      CONVERTER_SOURCE_DIR: /source-docs
+      CONVERTER_OUTPUT_DIR: /data/output
+      CONVERTER_UPLOAD_DIR: /data/uploads
+      CONVERTER_TEMP_DIR: /data/tmp
+      CONVERTER_REGISTRY_PATH: /data/registry.json
+
+      # ---- OCR（纯 CPU）----
+      # 容器内没有独立的 OCR 预处理阶段，必须开启内联回退
+      OCR_ENABLED: "true"
+      OCR_INLINE_FALLBACK: "true"
+      OCR_CACHE_DIR: /ocr-cache          # 挂载持久化，重跑直接命中
+      OCR_THREADS: "2"                   # 进程数 × 该值 ≈ 物理核数
+
+      # ---- 输出镜像（可选，备份/二次利用）----
+      CONVERTER_OUTPUT_MIRROR: /output-mirror
+
+      # ---- CHM ----
+      CHM_NAMESPACE_OUTPUT: "true"       # 以 CHM 名建命名空间，避免多本手册混树
+      CHM_SKIP_SCAFFOLD: "true"          # 跳过 header/tabstrip 等空壳辅助页
+      CHM_RENDER_PROCESSES: "true"       # 多进程渲染（绕开 GIL，约 9 倍提速）
+
+      # ---- 源文件消失处理 ----
+      # 源文件从源目录移除时：从 WeKnora 删除对应知识 + 归档源文件。
+      # 仅在"默认源目录的全量扫描"批次生效，局部扫描不会触发。
+      REGISTRY_HANDLE_MISSING: "true"
+      ARCHIVE_DIR: /archive
+
+      # ---- WeKnora 推送 ----
+      WEKNORA_ENABLED: "false"           # 切换上线时改为 true
+      WEKNORA_BASE_URL: http://app:8080
+      WEKNORA_API_KEY: ${WEKNORA_API_KEY:-}
+      WEKNORA_KB_ID: ${WEKNORA_KB_ID:-}
+
+      BATCH_WORKERS: "2"
+    volumes:
+      # 需可写：源文件消失时要移入归档目录
+      - /vol00/WUH721816ALE6L4/source-docs:/source-docs
+      - /vol00/WUH721816ALE6L4/archive:/archive
+      - /vol1/docker/docconverter-repo/data:/data
+      - /vol1/docker/docconverter-repo/ocr-cache:/ocr-cache
+      - /vol1/docker/docconverter-repo/output-mirror:/output-mirror
+    networks:
+      - weknora-net
