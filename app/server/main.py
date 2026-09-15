@@ -198,7 +198,11 @@ def start_batch_conversion(source_dir: str = Query(None),
     # 后台异步执行
     def run_batch():
         try:
-            start_batch(files, progress_callback=None, push_to_weknora=push)
+            # 仅"默认源目录的全量扫描"才允许源文件消失处理：
+            # 指定 source_dir 的局部扫描里，范围外的文件只是"未纳入本次扫描"，
+            # 不能据此判定为已删除（否则会把它们误删/误归档）
+            start_batch(files, progress_callback=None, push_to_weknora=push,
+                        full_scan=(source_dir is None))
         except Exception as e:
             logger.exception("批量转换线程异常: %s", e)
             # 复位批次状态，避免卡在 running
@@ -303,7 +307,8 @@ def watcher_start():
         logger.info(f"监控触发: {len(files)} 个新文件")
 
         def run_auto():
-            start_batch(files)
+            # watcher 只收到新增文件子集，缺席不等于删除 → full_scan=False
+            start_batch(files, full_scan=False)
 
         threading.Thread(target=run_auto, daemon=True).start()
 

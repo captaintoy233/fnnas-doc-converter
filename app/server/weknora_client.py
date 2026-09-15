@@ -255,22 +255,22 @@ class WeKnoraClient:
                 return self._api_call(method, path, data, files, params, timeout, retry + 1)
 
         if resp.status_code == 409:
-            # 官方按 (fileName+fileSize+fileHash) 判重，重复上传返回 409 duplicate_*
-            # 视为幂等成功：返回已有知识的 id
+            # WeKnora 按 (fileName+fileSize+fileHash) 判重，重复上传返回 409。
+            # 无论响应体是否包含 duplicate_* code，409 都表示"已存在"，
+            # 一律视为幂等成功，避免无限重试转换（尤其 CHM 等大文件）。
             try:
                 body = resp.json()
             except Exception:
                 body = {}
+            existing = body.get("data") or {}
+            doc_id = existing.get("id", "") if isinstance(existing, dict) else ""
             code = body.get("code", "")
-            if isinstance(code, str) and code.startswith("duplicate_"):
-                existing = body.get("data") or {}
-                doc_id = existing.get("id", "") if isinstance(existing, dict) else ""
-                return {"ok": True, "doc_id": doc_id, "duplicate": True,
-                        "status_code": 409, "message": body.get("message", "")}
-            err = resp.text[:300]
-            logger.error("WeKnora API %s %s: HTTP 409 %s", method, path, err)
-            return {"ok": False, "error": "HTTP 409: {}".format(err),
-                    "status_code": 409}
+            is_duplicate = isinstance(code, str) and code.startswith("duplicate_")
+            logger.info("WeKnora 409 (幂等): %s %s code=%s doc_id=%s",
+                        method, path, code, doc_id)
+            return {"ok": True, "doc_id": doc_id, "duplicate": True,
+                    "status_code": 409,
+                    "message": body.get("message", "已存在（幂等）")}
 
         if resp.status_code >= 400:
             err = resp.text[:300]
