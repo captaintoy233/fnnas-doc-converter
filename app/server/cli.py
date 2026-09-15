@@ -86,7 +86,8 @@ def cmd_batch(args):
         return 1
     print("开始批量转换: {} 个文件 (workers={})".format(
         len(files), get_config()["batch"].get("workers", 4)))
-    result = start_batch(files, push_to_weknora=None if not args.no_push else False)
+    result = start_batch(files, push_to_weknora=None if not args.no_push else False,
+                         full_scan=True)
     if isinstance(result, dict) and result.get("error"):
         print("错误: {}".format(result["error"]), file=sys.stderr)
         return 1

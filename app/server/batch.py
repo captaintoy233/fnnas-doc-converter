@@ -353,7 +353,10 @@ def _push_worker_loop():
                     else:
                         failed_detail.append("{}: {}".format(
                             out_rel, result.get("error", "推送失败")))
-                if ok_count == len(files_to_push):
+                # 判定推送结果：全部成功、或全部为 409 幂等重复，均视为推送完成
+                all_duplicate = (ok_count > 0 and not failed_detail
+                                 and task.weknora_error)  # 有 duplicate 标记且无真失败
+                if ok_count == len(files_to_push) or all_duplicate:
                     task.weknora_doc_id = ",".join(doc_ids)
                     task.weknora_push = PUSH_PUSHED
                     if not task.weknora_error:
@@ -364,7 +367,18 @@ def _push_worker_loop():
                         pass
                     logger.info("推送成功: %s (%d/%d 文件)%s", source_path,
                                 ok_count, len(files_to_push),
-                                " (含重复跳过)" if task.weknora_error else "")
+                                " (全部重复跳过)" if all_duplicate
+                                else (" (含重复跳过)" if task.weknora_error else ""))
+                elif ok_count > 0 and not failed_detail:
+                    # 部分文件 ok（含 duplicate），无真正失败 → 也视为成功
+                    task.weknora_doc_id = ",".join(doc_ids)
+                    task.weknora_push = PUSH_PUSHED
+                    try:
+                        get_registry().mark_pushed(source_path, task.weknora_doc_id)
+                    except Exception:
+                        pass
+                    logger.info("推送完成(部分重复): %s (%d/%d 文件)", source_path,
+                                ok_count, len(files_to_push))
                 else:
                     task.weknora_push = PUSH_FAILED
                     task.weknora_error = "; ".join(failed_detail[:3]) or "推送失败"
@@ -414,7 +428,9 @@ def _push_worker_loop():
                     else:
                         failed_detail.append("{}: {}".format(
                             out_rel, result.get("error", "推送失败")))
-                if ok_count == len(files_to_push):
+                # manual 模式同样：全部成功或全部 409 幂等均视为推送完成
+                all_dup = (ok_count > 0 and not failed_detail and task.weknora_error)
+                if ok_count == len(files_to_push) or all_dup:
                     task.weknora_doc_id = ",".join(doc_ids)
                     task.weknora_push = PUSH_PUSHED
                     if not task.weknora_error:
@@ -425,7 +441,17 @@ def _push_worker_loop():
                         pass
                     logger.info("推送成功: %s (%d/%d 文件)%s", source_path,
                                 ok_count, len(files_to_push),
-                                " (含重复跳过)" if task.weknora_error else "")
+                                " (全部重复跳过)" if all_dup
+                                else (" (含重复跳过)" if task.weknora_error else ""))
+                elif ok_count > 0 and not failed_detail:
+                    task.weknora_doc_id = ",".join(doc_ids)
+                    task.weknora_push = PUSH_PUSHED
+                    try:
+                        get_registry().mark_pushed(source_path, task.weknora_doc_id)
+                    except Exception:
+                        pass
+                    logger.info("推送完成(部分重复): %s (%d/%d 文件)", source_path,
+                                ok_count, len(files_to_push))
                 else:
                     task.weknora_push = PUSH_FAILED
                     task.weknora_error = "; ".join(failed_detail[:3]) or "推送失败"
@@ -501,23 +527,33 @@ class BatchTask:
         }
 
 
+# 嗅探器的通用文本兜底（只表示"未识别出结构"，不代表真是文本）→ 不参与路由
+_SNIFF_GENERIC_EXTS = {'.txt', ''}
+
+
 def _pick_converter(ext: str, path: Path):
     """按扩展名取转换器；若嗅探出不同格式，返回 [嗅探转换器, 扩展名转换器] 候选链
 
     修复: .et/.wps 等文件可能被魔数误判（如 .et 嗅探成 .xlsx），
     嗅探转换器失败时回退到扩展名转换器。
+
+    注意: 嗅探器对"非二进制内容"有 .txt 兜底，它只表示**没识别出结构**，
+    并不代表文件真是纯文本（损坏的二进制也会走到这里）。因此该通用兜底不参与
+    路由——否则会用文本转换器覆盖正确的扩展名转换器，把损坏文件读成乱码。
     """
     converter = registry.get(ext)
     sniffed_ext, sniffed_name = sniff_format(path)
     sniffed_converter = registry.get(sniffed_ext)
-    if sniffed_ext != ext and sniffed_converter is not None and sniffed_converter.available \
-            and sniffed_converter is not converter:
+    if (sniffed_ext != ext and sniffed_converter is not None
+            and sniffed_converter.available and sniffed_converter is not converter
+            and sniffed_ext not in _SNIFF_GENERIC_EXTS):
         return [sniffed_converter, converter], sniffed_ext, sniffed_name
     return [converter], ext, None
 
 
 def _convert_single(task: BatchTask, output_dir: Path, config: dict) -> BatchTask:
     """执行单个文件转换（含嗅探路由 + 多文件输出支持）"""
+    logger = logging.getLogger("docconverter.batch")
     task.started_at = datetime.now().isoformat()
     task.status = STATUS_RUNNING
 
@@ -622,6 +658,10 @@ def _convert_single(task: BatchTask, output_dir: Path, config: dict) -> BatchTas
             if cand is None or not cand.available:
                 continue
             try:
+                # 告知转换器输出根目录：图片/资源需要落到 MD 同级目录
+                # （HTML、CHM 等带图文档依赖该属性；不支持的转换器忽略即可）
+                if hasattr(cand, "assets_root"):
+                    cand.assets_root = str(output_dir)
                 out_files = cand.convert_to_files(str(path), rel)
                 if out_files:
                     task.converter = cand.display_name
@@ -640,6 +680,15 @@ def _convert_single(task: BatchTask, output_dir: Path, config: dict) -> BatchTas
             out_path = (output_dir / out_rel)
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(content, encoding="utf-8")
+            # 可选：同步一份到镜像目录（备份/二次利用）
+            mirror_root = (config.get("converter", {}) or {}).get("output_mirror") or ""
+            if mirror_root:
+                try:
+                    mpath = Path(mirror_root) / out_rel
+                    mpath.parent.mkdir(parents=True, exist_ok=True)
+                    mpath.write_text(content, encoding="utf-8")
+                except OSError as e:
+                    logger.warning("输出镜像失败 %s: %s", out_rel, e)
             if out_rel == md_rel or task.output_path is None:
                 task.output_path = str(out_path)
                 task.markdown = content
@@ -662,14 +711,97 @@ def _convert_single(task: BatchTask, output_dir: Path, config: dict) -> BatchTas
     return task
 
 
+def _handle_missing_sources(files: list, config: dict) -> dict:
+    """源文件从源目录消失时：从知识库删除对应文档，并可选择归档源文件。
+
+    背景：源文件被移除后，知识库里对应的旧文档若不删除会继续被检索到，
+    导致已下线/废止内容仍然生效。
+
+    安全护栏：
+    - 仅在全量扫描批次调用（部分批次里"缺席"不等于"已删除"）
+    - 扫描结果为 0 条时不执行（疑似挂载失败，避免误删整个知识库）
+    - 单条失败不中断整批，逐条计数上报
+    """
+    logger = logging.getLogger("docconverter.batch")
+    reg = get_registry()
+    current = {str(f.path) for f in files}
+    info = {"checked": True, "missing": 0, "deleted": 0, "archived": 0,
+            "failed": 0, "doc_ids": 0}
+    if not current:
+        info["skipped"] = "empty_scan"
+        logger.warning("源文件消失处理已跳过：扫描结果为 0 条（疑似源目录不可用）")
+        return info
+
+    missing = sorted(reg.all_files() - current)
+    info["missing"] = len(missing)
+    if not missing:
+        return info
+
+    wk_cfg = config.get("weknora", {}) or {}
+    archive_dir = (config.get("archive", {}) or {}).get("dir") or ""
+    client = None
+    if wk_cfg.get("enabled"):
+        try:
+            from weknora_client import WeKnoraClient
+            client = WeKnoraClient(config)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("源文件消失处理：初始化知识库客户端失败，仅做本地清理: %s", e)
+
+    for path in missing:
+        rec = reg.get(path) or {}
+        # 1) 从知识库删除（一个源文件可能产出多篇文档）
+        doc_ids = []
+        if rec.get("weknora_doc_id"):
+            doc_ids.append(rec["weknora_doc_id"])
+        for _rel, did in (rec.get("output_docs") or {}).items():
+            if did and did not in doc_ids:
+                doc_ids.append(did)
+        info["doc_ids"] += len(doc_ids)
+        if client is not None:
+            for did in doc_ids:
+                try:
+                    client.delete_knowledge(did)
+                except Exception as e:  # noqa: BLE001
+                    info["failed"] += 1
+                    logger.warning("源文件消失处理：删除知识失败 %s: %s", did, e)
+
+        # 2) 归档源文件（若配置了归档目录且文件仍在）
+        if archive_dir and os.path.exists(path):
+            try:
+                os.makedirs(archive_dir, exist_ok=True)
+                dst = os.path.join(archive_dir, os.path.basename(path))
+                if os.path.exists(dst):
+                    dst = os.path.join(
+                        archive_dir, "{}_{}".format(int(time.time()), os.path.basename(path)))
+                shutil.move(path, dst)
+                info["archived"] += 1
+            except Exception as e:  # noqa: BLE001
+                info["failed"] += 1
+                logger.warning("源文件消失处理：归档失败 %s: %s", path, e)
+
+        # 3) 清理注册表记录
+        try:
+            reg.delete(path)
+        except Exception:
+            pass
+        info["deleted"] += 1
+
+    logger.info("源文件消失处理: 缺失 %d，清理记录 %d，删除知识 %d，归档 %d，失败 %d",
+                info["missing"], info["deleted"], info["doc_ids"],
+                info["archived"], info["failed"])
+    return info
+
+
 def start_batch(files: list, progress_callback: Optional[Callable] = None,
-                push_to_weknora: Optional[bool] = None) -> dict:
+                push_to_weknora: Optional[bool] = None,
+                full_scan: bool = False) -> dict:
     """启动批量转换
 
     Args:
         files: list[FileInfo] 待转换文件
         progress_callback: (completed, total, task) 进度回调
         push_to_weknora: 是否推送到 WeKnora（None = 按配置 auto_push）
+        full_scan: 是否为"源目录全量扫描"批次；仅此类批次才做源文件消失处理
     """
     global _batch_state
 
@@ -710,6 +842,18 @@ def start_batch(files: list, progress_callback: Optional[Callable] = None,
             get_registry().prune([str(f.path) for f in files])
         except Exception:
             pass
+
+    # 源文件消失处理：从知识库删除对应文档（+ 可选归档源文件）。
+    # 仅在全量扫描批次执行——部分批次（如上传）里"缺席"不等于"已删除"。
+    missing_info = {"checked": False, "missing": 0, "deleted": 0, "archived": 0, "failed": 0}
+    if full_scan and bool(config.get("registry", {}).get("handle_missing", False)):
+        try:
+            missing_info = _handle_missing_sources(files, config)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("源文件消失处理失败: %s", e)
+            missing_info["error"] = str(e)[:200]
+    with _lock:
+        _batch_state["missing_sources"] = missing_info
 
     pending_tasks = list(tasks)
 
@@ -783,6 +927,8 @@ def get_batch_status() -> dict:
             "finished_at": _batch_state["finished_at"],
             "statistics": _batch_state["statistics"],
             "tasks": tasks_preview,
+            # 源文件消失处理结果（未启用时为 None）
+            "missing_sources": _batch_state.get("missing_sources"),
             "total_tasks": len(_batch_state["tasks"]),
             "push_queue_size": q.qsize() if q is not None else 0,
             "push_failed_count": failed_push_count(),

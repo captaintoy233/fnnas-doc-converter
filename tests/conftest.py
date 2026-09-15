@@ -21,6 +21,22 @@ sys.path.insert(0, str(SERVER_DIR))
 import pytest
 
 
+def pytest_addoption(parser):
+    """注册自定义命令行参数"""
+    parser.addoption(
+        "--snapshot-update",
+        action="store_true",
+        default=False,
+        help="Update snapshot baselines instead of comparing against them",
+    )
+
+
+@pytest.fixture()
+def snapshot_update(request):
+    """是否处于快照更新模式"""
+    return request.config.getoption("--snapshot-update")
+
+
 @pytest.fixture()
 def server_dir():
     return SERVER_DIR
