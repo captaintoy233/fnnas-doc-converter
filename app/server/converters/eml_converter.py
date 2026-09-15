@@ -7,6 +7,11 @@ EML / MSG 邮件 → Markdown 合并转换器
 
 - .eml 用标准库 email 解析
 - .msg 用 extract-msg 库解析（Outlook 格式）
+
+架构改进（v2 - Document Model）:
+- 先解析为统一 Document Model，再通过共享序列化器输出 Markdown
+- 新增 convert_to_document() 返回 Document Model
+- 使用结构化错误 MalformedDocumentError
 """
 import email
 import logging
@@ -17,6 +22,14 @@ from pathlib import Path
 
 from . import BaseConverter
 from .htm_converter import html_to_markdown
+
+# Document Model 导入
+from model.document import Document
+from model.block import Heading, Paragraph as MdParagraph, ThematicBreak
+from model.inline import Text
+from model.table import Table as MdTable, TableRow, TableCell
+from render.markdown import document_to_markdown
+from errors import MalformedDocumentError
 
 logger = logging.getLogger("docconverter.eml")
 
@@ -162,52 +175,89 @@ class EMLConverter(BaseConverter):
     def display_name(self) -> str:
         return "EML邮件"
 
-    def _convert_eml(self, file_path: str) -> str:
+    def _parse_eml(self, file_path: str):
+        """解析 EML 文件，返回 (msg, subject, frm, to, cc, date, body, attachments)"""
         from converters import registry
-        with open(file_path, "rb") as f:
-            msg = email.message_from_bytes(f.read())
+        try:
+            with open(file_path, "rb") as f:
+                msg = email.message_from_bytes(f.read())
+        except Exception as e:
+            raise MalformedDocumentError(
+                "Failed to parse EML file: {}".format(e),
+                file_path=file_path
+            )
 
         subject = _decode_mime_header(msg.get("Subject"))
         frm = _decode_mime_header(msg.get("From"))
         to = _decode_mime_header(msg.get("To"))
         cc = _decode_mime_header(msg.get("Cc"))
         date = msg.get("Date", "")
-
-        parts = ["# {}".format(subject or Path(file_path).stem), ""]
-        parts.append("| 字段 | 内容 |")
-        parts.append("|---|---|")
-        if frm:
-            parts.append("| 发件人 | {} |".format(frm.replace('|', '\\|')))
-        if to:
-            parts.append("| 收件人 | {} |".format(to.replace('|', '\\|')))
-        if cc:
-            parts.append("| 抄送 | {} |".format(cc.replace('|', '\\|')))
-        if date:
-            parts.append("| 日期 | {} |".format(date.replace('|', '\\|')))
-        parts.append("")
-
         body = _body_from_msg(msg)
-        if body:
-            parts.append(body.strip())
-        parts.append("")
+        attachments = list(_iter_attachments(msg))
+
+        return msg, subject, frm, to, cc, date, body, attachments
+
+    def convert_to_document(self, file_path: str, **kwargs) -> Document:
+        """转换为统一文档模型"""
+        from converters import registry
+        msg, subject, frm, to, cc, date, body, attachments = self._parse_eml(file_path)
+
+        doc = Document(title=subject or Path(file_path).stem)
+
+        # 邮件头表格
+        header_rows = [
+            TableRow(
+                cells=[
+                    TableCell(children=[Text("字段")], is_header=True),
+                    TableCell(children=[Text("内容")], is_header=True),
+                ],
+                is_header=True,
+            )
+        ]
+        if frm:
+            header_rows.append(TableRow(cells=[
+                TableCell(children=[Text("发件人")]),
+                TableCell(children=[Text(frm)]),
+            ]))
+        if to:
+            header_rows.append(TableRow(cells=[
+                TableCell(children=[Text("收件人")]),
+                TableCell(children=[Text(to)]),
+            ]))
+        if cc:
+            header_rows.append(TableRow(cells=[
+                TableCell(children=[Text("抄送")]),
+                TableCell(children=[Text(cc)]),
+            ]))
+        if date:
+            header_rows.append(TableRow(cells=[
+                TableCell(children=[Text("日期")]),
+                TableCell(children=[Text(date)]),
+            ]))
+
+        if len(header_rows) > 1:  # 有实际数据行
+            doc.add_block(MdTable(rows=header_rows))
+
+        # 正文
+        if body and body.strip():
+            doc.add_block(MdParagraph(children=[Text(body.strip())]))
 
         # 附件
-        attachments = list(_iter_attachments(msg))
         if attachments:
-            parts.append("---")
-            parts.append("")
-            parts.append("## 附件内容")
+            doc.add_block(ThematicBreak())
+            doc.add_block(Heading(level=2, children=[Text("附件内容")]))
             for fn, data, ctype in attachments:
-                parts.append("")
-                parts.append("### 附件: {}".format(fn))
-                parts.append("")
+                doc.add_block(Heading(level=3, children=[Text("附件: {}".format(fn))]))
                 md = _convert_attachment(fn, data, registry)
                 if md:
-                    parts.append(md)
-        return "\n".join(parts)
+                    doc.add_block(MdParagraph(children=[Text(md)]))
+
+        return doc
 
     def convert(self, file_path: str, **kwargs) -> str:
-        return self._convert_eml(file_path)
+        """转换为 Markdown 字符串（向后兼容接口）"""
+        doc = self.convert_to_document(file_path, **kwargs)
+        return document_to_markdown(doc)
 
 
 class MSGConverter(BaseConverter):
@@ -220,10 +270,16 @@ class MSGConverter(BaseConverter):
     def display_name(self) -> str:
         return "MSG邮件"
 
-    def _convert_msg(self, file_path: str) -> str:
+    def _parse_msg(self, file_path: str):
+        """解析 MSG 文件，返回 (subject, frm, to, date, body, attachments_data)"""
         import extract_msg
-        from converters import registry
-        msg = extract_msg.Message(file_path)
+        try:
+            msg = extract_msg.Message(file_path)
+        except Exception as e:
+            raise MalformedDocumentError(
+                "Failed to parse MSG file: {}".format(e),
+                file_path=file_path
+            )
         try:
             subject = msg.subject or Path(file_path).stem
             frm = str(msg.sender or "")
@@ -233,43 +289,78 @@ class MSGConverter(BaseConverter):
             if not body and msg.htmlBody:
                 body = html_to_markdown(msg.htmlBody)
 
-            parts = ["# {}".format(subject), ""]
-            parts.append("| 字段 | 内容 |")
-            parts.append("|---|---|")
-            if frm:
-                parts.append("| 发件人 | {} |".format(frm.replace('|', '\\|')))
-            if to:
-                parts.append("| 收件人 | {} |".format(to.replace('|', '\\|')))
-            if date:
-                parts.append("| 日期 | {} |".format(date.replace('|', '\\|')))
-            parts.append("")
-            if body:
-                parts.append(body.strip())
-            parts.append("")
-
             try:
                 attachments = list(msg.attachments)
             except Exception:
                 attachments = []
-            if attachments:
-                parts.append("---")
-                parts.append("")
-                parts.append("## 附件内容")
-                for att in attachments:
-                    fn = getattr(att, "longFilename", "") or getattr(att, "shortFilename", "") or "附件"
-                    parts.append("")
-                    parts.append("### 附件: {}".format(fn))
-                    parts.append("")
-                    data = att.data
-                    md = _convert_attachment(fn, data, registry)
-                    if md:
-                        parts.append(md)
-            return "\n".join(parts)
+
+            # Extract attachment data before closing
+            attach_data = []
+            for att in attachments:
+                fn = getattr(att, "longFilename", "") or getattr(att, "shortFilename", "") or "附件"
+                data = att.data
+                attach_data.append((fn, data))
+
+            return subject, frm, to, date, body, attach_data
         finally:
             try:
                 msg.close()
             except Exception:
                 pass
 
+    def convert_to_document(self, file_path: str, **kwargs) -> Document:
+        """转换为统一文档模型"""
+        from converters import registry
+        subject, frm, to, date, body, attach_data = self._parse_msg(file_path)
+
+        doc = Document(title=subject)
+
+        # 邮件头表格
+        header_rows = [
+            TableRow(
+                cells=[
+                    TableCell(children=[Text("字段")], is_header=True),
+                    TableCell(children=[Text("内容")], is_header=True),
+                ],
+                is_header=True,
+            )
+        ]
+        if frm:
+            header_rows.append(TableRow(cells=[
+                TableCell(children=[Text("发件人")]),
+                TableCell(children=[Text(frm)]),
+            ]))
+        if to:
+            header_rows.append(TableRow(cells=[
+                TableCell(children=[Text("收件人")]),
+                TableCell(children=[Text(to)]),
+            ]))
+        if date:
+            header_rows.append(TableRow(cells=[
+                TableCell(children=[Text("日期")]),
+                TableCell(children=[Text(date)]),
+            ]))
+
+        if len(header_rows) > 1:
+            doc.add_block(MdTable(rows=header_rows))
+
+        # 正文
+        if body and body.strip():
+            doc.add_block(MdParagraph(children=[Text(body.strip())]))
+
+        # 附件
+        if attach_data:
+            doc.add_block(ThematicBreak())
+            doc.add_block(Heading(level=2, children=[Text("附件内容")]))
+            for fn, data in attach_data:
+                doc.add_block(Heading(level=3, children=[Text("附件: {}".format(fn))]))
+                md = _convert_attachment(fn, data, registry)
+                if md:
+                    doc.add_block(MdParagraph(children=[Text(md)]))
+
+        return doc
+
     def convert(self, file_path: str, **kwargs) -> str:
-        return self._convert_msg(file_path)
+        """转换为 Markdown 字符串（向后兼容接口）"""
+        doc = self.convert_to_document(file_path, **kwargs)
+        return document_to_markdown(doc)

@@ -4,6 +4,11 @@
 流程: 解压（zip/tar/7z/rar）→ 递归扫描内部可转换文件 → 逐文件转换 →
 输出到 <归档名>/<内部相对路径>.md，完整保留压缩包内部目录结构。
 支持嵌套归档（深度受配置限制）。
+
+架构改进（v2 - Document Model）:
+- 新增 convert_to_document() 返回摘要 Document Model
+- convert_to_files() 保持不变（主要接口）
+- 使用结构化错误 MalformedDocumentError
 """
 import logging
 import re
@@ -15,6 +20,14 @@ from . import BaseConverter
 from extract import extract_archive, ARCHIVE_EXTS, CONTAINER_EXTS, SINGLE_EXTS, make_temp
 from sniffer import sniff_format
 from config import get_config
+
+# Document Model 导入
+from model.document import Document
+from model.block import Heading, Paragraph as MdParagraph
+from model.inline import Text
+from model.table import Table as MdTable, TableRow, TableCell
+from render.markdown import document_to_markdown
+from errors import MalformedDocumentError
 
 logger = logging.getLogger("docconverter.archive")
 
@@ -166,17 +179,47 @@ class ArchiveConverter(BaseConverter):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
-    def convert(self, file_path: str, **kwargs) -> str:
-        """API 单文件转换：返回归档清单摘要"""
-        outputs = self.convert_to_files(file_path, Path(file_path).name)
+    def convert_to_document(self, file_path: str, **kwargs) -> Document:
+        """转换为统一文档模型（摘要视图）
+        
+        ArchiveConverter 的主要接口是 convert_to_files()。
+        convert_to_document() 返回一个包含归档内容清单的摘要文档。
+        """
+        try:
+            outputs = self.convert_to_files(file_path, Path(file_path).name)
+        except Exception as e:
+            raise MalformedDocumentError(
+                "Failed to extract archive: {}".format(e),
+                file_path=file_path
+            )
+        
         total_chars = sum(len(c) for _, c in outputs)
-        lines = [
-            "# 归档: {}\n".format(Path(file_path).name),
-            "",
-            "共生成 {} 个 Markdown 文件，合计 {} 字符。\n".format(len(outputs), total_chars),
-            "| 输出文件 | 大小 |",
-            "|---|---|",
+        doc = Document(title="归档: {}".format(Path(file_path).name))
+        
+        # 摘要段落
+        summary_text = "共生成 {} 个 Markdown 文件，合计 {} 字符。".format(len(outputs), total_chars)
+        doc.add_block(MdParagraph(children=[Text(summary_text)]))
+        
+        # 内容清单表格
+        table_rows = [
+            TableRow(
+                cells=[
+                    TableCell(children=[Text("输出文件")], is_header=True),
+                    TableCell(children=[Text("大小")], is_header=True),
+                ],
+                is_header=True,
+            )
         ]
         for out_rel, content in outputs:
-            lines.append("| {} | {} 字符 |".format(out_rel, len(content)))
-        return "\n".join(lines)
+            table_rows.append(TableRow(cells=[
+                TableCell(children=[Text(out_rel)]),
+                TableCell(children=[Text("{} 字符".format(len(content)))]),
+            ]))
+        
+        doc.add_block(MdTable(rows=table_rows))
+        return doc
+
+    def convert(self, file_path: str, **kwargs) -> str:
+        """API 单文件转换：返回归档清单摘要"""
+        doc = self.convert_to_document(file_path, **kwargs)
+        return document_to_markdown(doc)
