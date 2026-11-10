@@ -71,15 +71,19 @@ _ENV = {
     "max_nested_depth": "EML_MAX_NESTED_DEPTH",
 }
 
-# 引用链起点：中文 Outlook / Gmail / Apple Mail 常见标记
+# 引用链起点：中文 Outlook / Gmail / Apple Mail 常见标记。
+# 注意 HTML→MD 之后这些标记常带 markdown 引用前缀（"> "）或强调符号，
+# 因此每个模式都容忍行首的 "> " / "*" / "_" 与空格。
+_Q = r"^[\s>*_]*"
 _QUOTE_PATTERNS = [
-    re.compile(r"^-{2,}\s*原始邮件\s*-{2,}", re.M),
-    re.compile(r"^-{2,}\s*Original Message\s*-{2,}", re.M | re.I),
-    re.compile(r"^-{2,}\s*Forwarded message\s*-{2,}", re.M | re.I),
-    re.compile(r"^_{10,}\s*$", re.M),
-    re.compile(r"^On .{5,80} wrote:\s*$", re.M),
-    re.compile(r"^发件人[:：].{0,60}\r?\n\s*发送时间[:：]", re.M),
-    re.compile(r"^在\s*\d{4}年.+写道[:：]\s*$", re.M),
+    re.compile(_Q + r"-{2,}\s*原始邮件\s*-{2,}", re.M),
+    re.compile(_Q + r"-{2,}\s*Original Message\s*-{2,}", re.M | re.I),
+    re.compile(_Q + r"-{2,}\s*Forwarded message\s*-{2,}", re.M | re.I),
+    re.compile(_Q + r"_{10,}\s*$", re.M),
+    re.compile(_Q + r"On .{5,80} wrote:\s*$", re.M),
+    re.compile(_Q + r"发件人[:：][^\n]{0,80}\n\s*>?\s*(发送时间|Sent)[:：]", re.M),
+    re.compile(_Q + r"在\s*\d{4}年[^\n]{0,40}写道[:：]\s*$", re.M),
+    re.compile(_Q + r"-{2,}\s*邮件原件\s*-{2,}", re.M),
 ]
 
 

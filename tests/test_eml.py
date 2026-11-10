@@ -124,6 +124,27 @@ def test_quoted_chain_is_collapsed(tmp_path):
     assert len(md) < len(history), "折叠后总长度应远小于原始引用链"
 
 
+def test_quoted_chain_after_html_conversion_is_collapsed(tmp_path):
+    """HTML 正文转 MD 后引用标记带 "> " 前缀，也必须能识别并折叠。"""
+    history = "历史转发正文内容。" * 300
+    html = (
+        "<html><body><p>本次说明：按新标准执行。</p>"
+        "<blockquote>-----原始邮件-----<br>"
+        "发件人: 赵六<br>发送时间: 2026-02-02<br>" + history +
+        "</blockquote></body></html>")
+    msg = EmailMessage()
+    msg["Subject"] = "Re: 转发：标准变更"
+    msg.set_content("占位纯文本（故意很短，迫使走 HTML 分支）")
+    msg.add_alternative(html, subtype="html")
+    p = tmp_path / "quote_html.eml"
+    p.write_bytes(msg.as_bytes())
+
+    md = EMLConverter().convert(str(p))
+    assert "本次说明" in md
+    assert "引用历史已折叠" in md, "HTML 转 MD 后的引用链同样要折叠"
+    assert len(md) < len(history)
+
+
 def test_nested_rfc822_rendered_as_subsection(tmp_path):
     inner = EmailMessage()
     inner["Subject"] = "被转发的原始邮件"
