@@ -14,7 +14,7 @@ from . import BaseConverter
 
 # Document Model 导入
 from model.document import Document
-from model.block import Heading, Table as MdTable
+from model.block import Heading, Paragraph as MdParagraph, Table as MdTable
 from model.inline import Text
 from model.table import TableRow, TableCell
 from render.markdown import document_to_markdown
@@ -42,36 +42,65 @@ class XLSXConverter(BaseConverter):
         return ['.xlsx']
 
     def convert_to_document(self, file_path: str, **kwargs) -> Document:
-        """转换为统一文档模型"""
-        wb = openpyxl.load_workbook(file_path, data_only=True)
+        """转换为统一文档模型（带规模护栏：只读流式 + 行列/字符上限）"""
+        from .spreadsheet_limits import get_limits, SheetBudget
+        limits = get_limits()
+        wb = openpyxl.load_workbook(
+            file_path, data_only=True, read_only=bool(limits.get("read_only", True)))
         result = Document()
-        
-        for sn in wb.sheetnames:
-            ws = wb[sn]
-            
-            # Sheet 标题
-            result.add_block(Heading(level=1, children=[Text(sn)]))
-            
-            # 构建表格
-            rows = []
-            for ri, row in enumerate(ws.iter_rows(values_only=True)):
-                cells = []
-                for val in row:
-                    text = _fmt_cell_value(val)
-                    cells.append(TableCell(
-                        children=[Text(text)] if text else [],
-                        is_header=(ri == 0)
-                    ))
-                
-                # 跳过全空行
-                if all(not c.text.strip() for c in cells):
-                    continue
-                
-                rows.append(TableRow(cells=cells, is_header=(ri == 0)))
-            
-            if rows:
-                result.add_block(MdTable(rows=rows))
-        
+
+        try:
+            sheet_limits = SheetBudget(limits)
+            for si, sn in enumerate(wb.sheetnames):
+                if not sheet_limits.take_sheet(si):
+                    result.add_block(MdParagraph(children=[Text(
+                        sheet_limits.sheet_note(len(wb.sheetnames) - si))]))
+                    break
+                ws = wb[sn]
+
+                # Sheet 标题
+                result.add_block(Heading(level=1, children=[Text(sn)]))
+
+                # 只读模式下 max_row/max_column 可能为 None
+                total_rows = getattr(ws, "max_row", None) or 0
+                total_cols = getattr(ws, "max_column", None) or 0
+                budget = SheetBudget(limits, total_rows, total_cols)
+                ncols = budget.clamp_cols(total_cols) if total_cols else 0
+
+                rows = []
+                for ri, row in enumerate(ws.iter_rows(values_only=True)):
+                    if ncols:
+                        row = row[:ncols]
+                    if not budget.take_row(len(row)):
+                        break
+                    cells = []
+                    row_chars = 0
+                    for val in row:
+                        text = _fmt_cell_value(val)
+                        row_chars += len(text)
+                        cells.append(TableCell(
+                            children=[Text(text)] if text else [],
+                            is_header=(ri == 0)
+                        ))
+
+                    # 跳过全空行
+                    if all(not c.text.strip() for c in cells):
+                        continue
+
+                    budget.use(len(row), row_chars)
+                    rows.append(TableRow(cells=cells, is_header=(ri == 0)))
+
+                if rows:
+                    result.add_block(MdTable(rows=rows))
+                note = budget.note()
+                if note:
+                    result.add_block(MdParagraph(children=[Text(note)]))
+        finally:
+            try:
+                wb.close()
+            except Exception:
+                pass
+
         return result
 
     def convert(self, file_path: str, **kwargs) -> str:
