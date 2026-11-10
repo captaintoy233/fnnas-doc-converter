@@ -15,7 +15,7 @@ from . import BaseConverter
 
 # Document Model 导入
 from model.document import Document
-from model.block import Heading, Table as MdTable
+from model.block import Heading, Paragraph as MdParagraph, Table as MdTable
 from model.inline import Text
 from model.table import TableRow, TableCell
 from render.markdown import document_to_markdown
@@ -52,7 +52,9 @@ class ETConverter(BaseConverter):
         return ['.et']
 
     def convert_to_document(self, file_path: str, **kwargs) -> Document:
-        """转换为统一文档模型"""
+        """转换为统一文档模型（带规模护栏：行列/字符上限）"""
+        from .spreadsheet_limits import get_limits, SheetBudget
+        limits = get_limits()
         try:
             wb = xlrd.open_workbook(file_path)
         except Exception as e:
@@ -63,18 +65,30 @@ class ETConverter(BaseConverter):
 
         result = Document()
 
-        for sn in wb.sheet_names():
+        sheet_limits = SheetBudget(limits)
+        for si, sn in enumerate(wb.sheet_names()):
+            if not sheet_limits.take_sheet(si):
+                result.add_block(MdParagraph(children=[Text(
+                    sheet_limits.sheet_note(len(wb.sheet_names()) - si))]))
+                break
             ws = wb.sheet_by_name(sn)
 
             # Sheet name as Heading(1)
             result.add_block(Heading(level=1, children=[Text(sn)]))
 
+            budget = SheetBudget(limits, ws.nrows, ws.ncols)
+            ncols = budget.clamp_cols(ws.ncols)
+
             # Build table rows
             rows = []
             for r in range(ws.nrows):
+                if not budget.take_row(ncols):
+                    break
                 cells = []
-                for c in range(ws.ncols):
+                row_chars = 0
+                for c in range(ncols):
                     text = _fmt(ws.cell(r, c))
+                    row_chars += len(text)
                     cells.append(TableCell(
                         children=[Text(text)] if text else [],
                         is_header=(r == 0)
@@ -84,10 +98,14 @@ class ETConverter(BaseConverter):
                 if all(not cell.text.strip() for cell in cells):
                     continue
 
+                budget.use(ncols, row_chars)
                 rows.append(TableRow(cells=cells, is_header=(r == 0)))
 
             if rows:
                 result.add_block(MdTable(rows=rows))
+            note = budget.note()
+            if note:
+                result.add_block(MdParagraph(children=[Text(note)]))
 
         return result
 

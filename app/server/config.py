@@ -7,12 +7,12 @@ from pathlib import Path
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.4.0"
 # 渲染版本：**仅当转换逻辑变更会改变输出内容时**递增（与 APP_VERSION 解耦）。
 # 注册表会记录每次转换时的该值，不一致即重新转换。
 # 没有它的话，升级后源文件哈希没变，老输出会被增量永久跳过——
 # v2.2.0 修复的丢图问题正是这种情况：代码换了但产物没重生成。
-RENDER_VERSION = "2.3.0"
+RENDER_VERSION = "2.4.0"
 APP_NAME = "DocConverter"
 
 CONFIG_PATHS = [
@@ -166,6 +166,24 @@ DEFAULT_CONFIG = {
         # HTML 图片处理：留空则跟随 ocr.enabled（启用 OCR 时用 link）
         "image_mode": "",               # none | link | base64
     },
+    "eml": {
+        # 邮件 → MD 的规模护栏（真实语料单封最大 41 MB、单个 xlsx 能解出千万字符）
+        "max_attach_mb": 50,            # 单附件体积上限，超过只记清单不转换
+        "max_total_attach_mb": 150,     # 单封邮件附件总量预算
+        "max_attach_chars": 120000,     # 单个附件转换产出上限
+        "max_total_chars": 400000,      # 单封邮件最终 MD 上限
+        "collapse_quoted": True,        # 折叠 Re:/转发 引用链（23% 邮件带引用历史）
+        "quote_preview_chars": 400,     # 折叠后保留的引用预览长度
+        "max_nested_depth": 1,          # message/rfc822 内嵌邮件递归深度
+    },
+    "spreadsheet": {
+        # xlsx/et/xls 转换的规模护栏（防超宽超长表撑爆内存）
+        "max_rows": 3000,               # 每 sheet 保留行数（含表头）
+        "max_cols": 80,                 # 每 sheet 保留列数
+        "max_cells": 200000,            # 每 sheet 单元格预算
+        "max_chars": 120000,            # 每 sheet 产出字符上限
+        "read_only": True,              # xlsx 用 openpyxl 只读流式模式
+    },
     "registry": {
         "backend": "json",            # json | sqlite
         "path": "/data/registry.json",
@@ -249,6 +267,18 @@ ENV_MAP = [
     ("OCR_ANNOTATE_LOW_QUALITY", ["ocr", "annotate_low_quality"], bool),
     ("OCR_LOW_QUALITY_SCORE", ["ocr", "low_quality_score"], float),
     ("OCR_NO_TEXT_MIN_SIDE", ["ocr", "no_text_min_side"], int),
+    ("EML_MAX_ATTACH_MB", ["eml", "max_attach_mb"], int),
+    ("EML_MAX_TOTAL_ATTACH_MB", ["eml", "max_total_attach_mb"], int),
+    ("EML_MAX_ATTACH_CHARS", ["eml", "max_attach_chars"], int),
+    ("EML_MAX_TOTAL_CHARS", ["eml", "max_total_chars"], int),
+    ("EML_COLLAPSE_QUOTED", ["eml", "collapse_quoted"], bool),
+    ("EML_QUOTE_PREVIEW_CHARS", ["eml", "quote_preview_chars"], int),
+    ("EML_MAX_NESTED_DEPTH", ["eml", "max_nested_depth"], int),
+    ("SPREADSHEET_MAX_ROWS", ["spreadsheet", "max_rows"], int),
+    ("SPREADSHEET_MAX_COLS", ["spreadsheet", "max_cols"], int),
+    ("SPREADSHEET_MAX_CELLS", ["spreadsheet", "max_cells"], int),
+    ("SPREADSHEET_MAX_CHARS", ["spreadsheet", "max_chars"], int),
+    ("SPREADSHEET_READ_ONLY", ["spreadsheet", "read_only"], bool),
     ("CONVERTER_REGISTRY_PATH", ["registry", "path"], str),
     ("REGISTRY_HANDLE_MISSING", ["registry", "handle_missing"], bool),
     ("ARCHIVE_DIR", ["archive", "dir"], str),
