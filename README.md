@@ -14,7 +14,13 @@
 - **目录结构保留**：`AI/政策制度/xxx.docx` → `AI-OUT/政策制度/xxx.md`
 - **压缩包自动解压**：`资料包.zip` → `AI-OUT/资料包/<内部结构>/xxx.md`，支持嵌套归档
 - **EML/MSG 邮件合并**：邮件头 + 正文 + 附件内容合并为**单个 MD**
-- **CHM 支持**：7zz 解压 + `.hhc` 章节分组合并（如 213MB 信贷手册）
+- **CHM 支持**：7zz 解压 + `.hhc` 索引树还原 → **每个制度/文档一个 MD**，
+  按原目录层级落地（`<CHM名>/01.外部规章/人民银行/xxx.md`），便于定期增量更新
+- **页级增量**：`registry` 记录每个输出 MD 的内容指纹，CHM 换版后
+  只重渲染/重嵌入**变化的制度**，未变页零成本复用（数千页从分钟级降到秒级）
+- **图片 OCR（通用接口）**：`backend=rapidocr` 本地 CPU，或 `backend=remote`
+  对接任意 HTTP OCR 服务（GPU 主机 PaddleOCR / PaddleOCR-VL / 自建），
+  随包提供 `serve_ocr.py` 参考实现；结果按图片内容哈希缓存，换版不重复识别
 - **增量同步**：`registry.json` 记录 SHA-256 指纹，未变化文件跳过（转换 + 推送双重去重）
 - **WeKnora 对接**：JWT / **API Key** 双认证、异步推送队列、失败重试、
   相对路径标题（知识库内保留目录结构）、无法转换时**回退推送原始文件**
@@ -222,6 +228,163 @@ HTML→MD（BeautifulSoup + markdownify）是纯 Python 的 CPU 密集任务，
 配置：`chm.render_processes`（默认 true）、`chm.mp_threshold`（默认 50，
 低于阈值用线程以省去进程启动开销）。
 
+## CHM 输出布局（v2.3.0：每制度一个 MD）
+
+`chm.output_layout` 两个取值：
+
+| 取值 | 行为 | 适用 |
+|---|---|---|
+| `tree`（默认） | 按 `.hhc` 索引层级建同名文件夹，**每个索引条目一个 MD** | 手册会定期更新、需要按制度增量入库 |
+| `chapter` | 每个顶层章节合并成一个 MD（v2.2.0 及更早的旧行为） | 仅做整卷归档，不推荐 |
+
+用 `tree` 的三个理由：
+
+1. **增量友好**：单篇制度几十 KB，改一篇只重嵌一篇；合并成大 MD 后
+   每次更新都要整章重新切分/嵌入/摘要，代价随章节体量放大。
+2. **命中精准**：检索命中的是具体制度，不必让模型在大文件里二次定位。
+3. **结构可读**：知识库里直接看到 `01.外部规章/人民银行/xxx`，
+   与源手册的目录一一对应，也便于按目录做 `folder → KB` 路由。
+
+`chm.namespace_output`（默认 true）会再套一层 `<CHM 文件名>/`，
+使多本手册共用一个输出根目录时不互相覆盖。
+
+## 页级增量（v2.3.0：只更新变化的制度）
+
+一个 CHM 会产出成百上千个 MD，源文件级 SHA-256 只能判断"整本变了"，
+无法回答"哪几篇变了"。v2.3.0 在注册表里增加 `page_hashes`
+（`{输出相对路径: 内容 sha256}`），形成三级增量：
+
+| 层级 | 判据 | 效果 |
+|---|---|---|
+| 源文件 | `source_hash` + `render_version` | 整本未变 → 全部跳过 |
+| **输出页** | **`page_hashes`** | **只重渲染变化的页；未变页直接读回磁盘产物** |
+| 推送 | `changed_pages` 过滤 | **只有变化的页进入嵌入/摘要队列**；消失的页从知识库删除 |
+
+实测（河南信贷手册 2026-11-05，4509 篇）：首轮全量转换后，
+第二轮把全部页指纹喂回，重渲染 **0 篇**、内容逐字节一致，耗时从
+分钟级降到秒级。日常只会动几篇时，只有那几篇会走嵌入。
+
+注意：`render_version` 变更（升级转换器）时仍会全量重转，这是有意的——
+转换逻辑变了必须重出产物；重转后若内容未变，页级比对会阻止无谓的重新嵌入。
+
+## 图片 OCR：通用接口（v2.3.0）
+
+CHM/HTML/PDF 里的图片文字需要识别后注入 MD 才能被检索。v2.3.0 把 OCR
+抽象成一个可替换后端，配置一个 URL 就能换引擎，转换器代码零改动：
+
+```yaml
+ocr:
+  enabled: true
+  backend: remote           # rapidocr（本地 CPU，默认）| remote（HTTP 服务）
+  remote:
+    url: "http://100.81.98.0:8890/ocr"   # GPU 主机
+    token: "<与 serve_ocr --token 一致>"
+    timeout: 300
+    send_b64: false         # true=跨机 base64 传图；false=同机共享卷传路径
+```
+
+协议（`app/server/serve_ocr.py` 是参考实现，也可自己实现）：
+
+```
+POST /ocr  {"image": "<服务端路径>"} 或 {"image_b64": "...", "name": "x.png"}
+     -> {"ok": true, "text": "...", "engine": "...", "seconds": 1.2}
+     -> {"ok": false, "error": "..."}
+GET  /health -> {"ok": true, "engine": "...", "device": "..."}
+```
+
+在 GPU 主机上启动（支持 PaddleOCR 常驻 worker、RapidOCR、任意命令行）：
+
+```bash
+# 2080Ti：PaddleOCR（PP-OCRv6，1~2s/张、约 300MiB 显存）
+python serve_ocr.py --backend paddle --engine fast \
+    --python /path/to/paddle-venv/python \
+    --worker /path/to/paddle_ocr_worker.py \
+    --host 0.0.0.0 --port 8890 --token <secret>
+
+# 纯 CPU 机器
+python serve_ocr.py --backend rapid --host 0.0.0.0 --port 8890 --token <secret>
+
+# 包装任意外部 OCR 命令
+python serve_ocr.py --backend cmd --cmd "tesseract {image} - -l chi_sim" --port 8890
+```
+
+识别结果按「图片内容 SHA-1 + 识别配置签名」缓存，签名含后端 URL：
+换服务或改参数会自动失效，同一张图跨版本不会重复识别。
+
+配套环境变量：`OCR_BACKEND` / `OCR_REMOTE_URL` / `OCR_REMOTE_TOKEN` /
+`OCR_REMOTE_TIMEOUT` / `OCR_REMOTE_B64`。
+
+### 按需调用（GPU 资源紧张时的推荐做法）
+
+**不要把 OCR 服务做成常驻/开机自启。** 推荐把 OCR 拆成"预处理"与"转换"两段：
+
+```
+① 预处理：临时拉起 GPU 服务 → 批量识别待用图片 → 结果写缓存 → 关服务
+② 转换：  ocr.inline_fallback=false，只读缓存，全程不碰引擎/GPU
+```
+
+`serve_ocr.py` 为此提供两个开关：
+
+| 参数/端点 | 作用 |
+|---|---|
+| `--idle-timeout N`（默认 900 秒） | 无请求超过 N 秒自动退出，并结束 paddle worker 子进程（显存随之归还） |
+| `POST /shutdown` | 显式关闭，批跑完立即释放，不必等超时 |
+
+预处理命令行 `app/server/ocr_batch.py`：
+
+```bash
+# 只统计不识别，先看规模
+python ocr_batch.py --source /data/output --cache-dir /data/ocr-cache --dry-run
+
+# 本地 CPU 引擎（无需 GPU；3~4 秒/张）
+python ocr_batch.py --source /data/output --cache-dir /data/ocr-cache \
+    --backend rapidocr --workers 2 --report /data/ocr-report.json
+
+# 远程 GPU：用前后置命令管理服务生命周期，跑完即关
+python ocr_batch.py --source /data/output --cache-dir /data/ocr-cache \
+    --backend remote --remote-url http://gpu-host:8890/ocr --token <secret> \
+    --send-b64 --workers 3 \
+    --start-cmd "ssh gpu-host 'cd /opt/ocr && nohup python serve_ocr.py --backend paddle --port 8890 --token <secret> --idle-timeout 300 >/tmp/ocr.log 2>&1 &'" \
+    --stop-cmd  "curl -s -X POST -H 'Authorization: Bearer <secret>' http://gpu-host:8890/shutdown"
+```
+
+要点：
+
+- **预处理与转换必须用同一份 ocr 配置**（`backend`、`cache_dir`、分块参数都参与
+  缓存签名），否则签名不一致会让缓存全部失效，转换期又去现场识别。
+- `--dry-run` 会先算出「已缓存 / 需识别」两笔数量，便于估算 GPU 占用时长。
+- 单张图失败会重试（`--retry`），仍失败只记账不中断整批。
+
+### 低质量图片：只标注，不重试
+
+检测不出可信文字的图**不做二次识别、不换模型**，只在 MD 里打标，
+便于以后确认必需时按标注清单统一补识别：
+
+```markdown
+<!-- ocr:begin -->
+> **［图片文字］**
+> ⚠️ 图片文字识别质量偏低（疑似分块重复碎片 6 处），以下内容仅作检索线索，引用请核对原图。
+> 城市行
+> 个贷中心
+> ...
+<!-- ocr:end -->
+```
+
+判据（`ocr.quality_of`）：
+
+| 情况 | 判定 | 说明 |
+|---|---|---|
+| 文本块平均置信度 < `low_quality_score`（默认 0.62） | `low` | 本地引擎提供分数 |
+| 分块识别出现"半句重复"（≥2 对前缀关系） | `low` | 分块接缝伪影，置信度往往很高，只能靠文本形态发现 |
+| 图片 min 边 ≥ `no_text_min_side`（默认 200）却没识别出字 | `no_text` | 可能纯图形，也可能识别失败 |
+| 远程引擎只回文本（无置信度） | `unknown` | 不伪造分数，不打标 |
+
+开关：`ocr.annotate_low_quality`（默认 true）；环境变量
+`OCR_ANNOTATE_LOW_QUALITY` / `OCR_LOW_QUALITY_SCORE` / `OCR_NO_TEXT_MIN_SIDE`。
+
+> 实测参考：同一批图，CPU 分块引擎因切句会给出"高置信度但含重复碎片"的结果，
+> 会被 `low` 标注；换成 GPU 整图识别（不分块）后该伪影消失。
+
 ## 源文件消失处理（知识库一致性）
 
 源文件从源目录移除后，若不在知识库中删除对应文档，已下线/废止内容会继续被检索到。
@@ -254,6 +417,10 @@ Word/Excel 导出 HTML 时会生成 `header.htm` / `tabstrip.htm` / `tabscript.h
 含真实表格内容（如"附表2-1：…"），按模式一概过滤会丢失正文。
 
 ## 图片 OCR（纯 CPU，让图片里的文字进入知识库）
+
+> v2.3.0 起引擎可替换（本地 CPU / 远程 GPU），并支持"按需预处理 + 转换只读缓存"
+> 与低质量标注——见上文 [图片 OCR：通用接口](#图片-ocr通用接口v230)。
+> 本节保留 CPU 路径的实现细节与实测数据。
 
 大量制度文件的正文其实是**图片**（扫描页、界面截图、流程图），只转文本等于内容全丢。
 启用 OCR 后，图片中的文字会被提取并作为引用块注入 MD，图片本身也复制到文档旁。

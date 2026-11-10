@@ -235,7 +235,11 @@ class ImagePipelineMixin:
         if not text:
             if stats is not None:
                 stats["ocr_empty"] = stats.get("ocr_empty", 0) + 1
-            return ""
+            # 低质量只标注、不重试：图够大却没字时留一条提示，
+            # 便于日后按标注清单统一补识别（cfg.annotate_low_quality）
+            note = _ocr.to_markdown(data, self.ocr_cfg.get("label", "图片文字"),
+                                    self.ocr_cfg)
+            return "\n\n" + note if note else ""
         if stats is not None:
             stats["ocr_hit"] = stats.get("ocr_hit", 0) + 1
             stats["ocr_chars"] = stats.get("ocr_chars", 0) + len(text)
@@ -251,4 +255,5 @@ class ImagePipelineMixin:
                 if stats is not None:
                     stats["flow_table"] = stats.get("flow_table", 0) + 1
                 return "\n\n" + table
-        return "\n\n" + _ocr.to_markdown(data, self.ocr_cfg.get("label", "图片文字"))
+        return "\n\n" + _ocr.to_markdown(data, self.ocr_cfg.get("label", "图片文字"),
+                                         self.ocr_cfg)

@@ -15,6 +15,8 @@ import hashlib
 import json
 import os
 import re
+import urllib.request
+from pathlib import Path
 from typing import Optional
 
 _ENGINE = None
@@ -28,6 +30,13 @@ def default_config() -> dict:
     return {
         "enabled": False,
         "backend": "rapidocr",
+        # 远程 OCR 服务（backend=remote 时生效）：任何实现该协议的引擎均可接入
+        "remote": {
+            "url": "",                 # 如 http://100.81.98.0:8890/ocr
+            "token": "",               # Bearer，可空
+            "timeout": 300,
+            "send_b64": False,         # true=跨机 base64 传输；false=同机路径
+        },
         "cache_dir": os.path.expanduser("~/.cache/docconverter/ocr"),
         # 最长边超过该值则分块（RapidOCR 内部对超限图会缩放，导致小字漏检）
         "tile_threshold": 960,
@@ -48,6 +57,12 @@ def default_config() -> dict:
         "inline_fallback": False,
         "label": "图片文字",
         "placeholder_missing": True,
+        # ── 质量标注（低质量图不重试，仅在 MD 里打标，便于后续统一补识别）──
+        "annotate_low_quality": True,
+        # 文本块平均置信度低于该值 → 标注"识别质量低"
+        "low_quality_score": 0.62,
+        # 图片足够大却没识别出任何文字 → 标注"未识别到文字"（可能是纯图形或识别失败）
+        "no_text_min_side": 200,
     }
 
 
@@ -63,8 +78,11 @@ _SIG_KEYS = ("tile_threshold", "tile_size", "tile_overlap", "min_score",
 
 def _config_signature(cfg: dict) -> str:
     """识别配置指纹（不含 cache_dir / 线程数等不影响结果的项）"""
-    payload = json.dumps({k: cfg.get(k) for k in _SIG_KEYS}, sort_keys=True)
-    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+    payload = {k: cfg.get(k) for k in _SIG_KEYS}
+    if payload.get("backend") == "remote":
+        # 远程引擎不同实现结果不同：把 url 并入签名，换服务即缓存失效
+        payload["remote_url"] = (cfg.get("remote") or {}).get("url", "")
+    return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:12]
 
 
 def image_key(path: str) -> str:
@@ -105,9 +123,86 @@ def cache_save(cache_dir: str, key: str, data: dict) -> None:
 # 引擎
 # ----------------------------------------------------------------------
 
+class RemoteOcrEngine:
+    """HTTP 远程 OCR 引擎适配器（通用接口）。
+
+    协议（与部署端 serve_ocr.py / worker 封装一致）：
+      POST {url}  body={"image": "<本地文件路径>"}   （同机共享卷场景）
+      POST {url}  body={"image_b64": "...", "name": "x.png"}  （跨机场景，自动 base64）
+      返回 {"ok": true, "text": "...", "engine": "...", "seconds": 1.2}
+      或   {"ok": false, "error": "..."}
+
+    任何实现该协议的 GPU/CPU OCR 服务（PaddleOCR、PaddleOCR-VL、
+    RapidOCR-Server、Tesseract HTTP 包装等）都可以直接接入，转换器零改动。
+    """
+
+    def __init__(self, cfg: dict):
+        oc = cfg.get("remote") or {}
+        self.url = oc.get("url", "")
+        self.token = oc.get("token", "")
+        self.timeout = int(oc.get("timeout", 300))
+        self.send_b64 = bool(oc.get("send_b64", False))
+        if not self.url:
+            raise RuntimeError("ocr.backend=remote 但未配置 ocr.remote.url")
+
+    def __call__(self, image_path):
+        p = str(image_path)
+        if self.send_b64:
+            import base64
+            payload = {"image_b64": base64.b64encode(Path(p).read_bytes()).decode(),
+                       "name": Path(p).name}
+        else:
+            payload = {"image": p}
+        req = urllib.request.Request(
+            self.url, data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"}, method="POST")
+        if self.token:
+            req.add_header("Authorization", "Bearer " + self.token)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=self.timeout) as resp:
+            out = json.loads(resp.read().decode("utf-8"))
+        if not out.get("ok"):
+            raise RuntimeError("远程 OCR 失败: {}".format(out.get("error", "unknown")))
+        return out
+
+
+def _parse_remote_result(out: dict) -> list:
+    """把远程引擎返回的 text/blocks 归一成本地 blocks 结构。
+
+    远程引擎若只回纯文本则不携带置信度：这里把 score 置 None，
+    让 quality_of 走"无置信度"分支，而不是伪造 1.0 冒充高可信。
+    """
+    blocks = out.get("blocks")
+    if isinstance(blocks, list) and blocks and isinstance(blocks[0], dict) \
+            and "text" in blocks[0]:
+        norm = []
+        for b in blocks:
+            if not (b.get("text") or "").strip():
+                continue
+            sc = b.get("score")
+            norm.append({"text": b["text"].strip(),
+                         "score": sc if isinstance(sc, (int, float)) else None,
+                         "x": b.get("x", 0), "y": b.get("y", 0),
+                         "w": b.get("w", 0), "h": b.get("h", 0)})
+        return norm
+    text = (out.get("text") or "").strip()
+    if not text:
+        return []
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    return [{"text": ln, "score": None, "x": 0, "y": i * 20, "w": 0, "h": 18}
+            for i, ln in enumerate(lines)]
+
+
 def get_engine(cfg: dict):
-    """进程内单例引擎（配置变化时重建）"""
+    """进程内单例引擎（配置变化时重建）；backend=remote 走 HTTP 远程引擎"""
     global _ENGINE, _ENGINE_KEY
+    if (cfg.get("backend") or "rapidocr") == "remote":
+        key = "remote::" + json.dumps(cfg.get("remote") or {}, sort_keys=True)
+        if _ENGINE is not None and _ENGINE_KEY == key:
+            return _ENGINE
+        _ENGINE = RemoteOcrEngine(cfg)
+        _ENGINE_KEY = key
+        return _ENGINE
     key = json.dumps({k: cfg.get(k) for k in (
         "intra_op_num_threads", "inter_op_num_threads",
         "max_side_len", "det_limit_side_len")}, sort_keys=True)
@@ -280,6 +375,36 @@ def ocr_image(path: str, cfg: dict = None, use_cache: bool = True) -> dict:
             hit["cached"] = True
             return hit
 
+    # ---- 远程引擎通道（GPU 主机 / 任意 HTTP OCR 服务）----
+    if (cfg.get("backend") or "rapidocr") == "remote":
+        eng = get_engine(cfg)
+        try:
+            out = eng(path)
+        except Exception as e:
+            data = {"key": key, "sig": sig, "error": str(e)[:300], "blocks": [],
+                    "text": "", "width": 0, "height": 0, "tiled": False,
+                    "engine": "remote", "cached": False}
+            if use_cache:
+                cache_save(cfg["cache_dir"], key, data)   # 失败也入缓存，避免反复打挂服务
+            raise RuntimeError("远程 OCR 失败: {}".format(str(e)[:200])) from None
+        if not out.get("ok"):
+            err = out.get("error", "unknown")
+            data = {"key": key, "sig": sig, "error": str(err)[:300], "blocks": [],
+                    "text": "", "width": 0, "height": 0, "tiled": False,
+                    "engine": "remote", "cached": False}
+            if use_cache:
+                cache_save(cfg["cache_dir"], key, data)
+            raise RuntimeError("远程 OCR 失败: {}".format(err))
+        blocks = sort_reading_order(_parse_remote_result(out))
+        mins = int(cfg.get("min_text_chars", 1))
+        text = "\n".join(b["text"] for b in blocks if len(b["text"]) >= mins)
+        data = {"key": key, "sig": sig, "width": 0, "height": 0, "tiled": False,
+                "blocks": blocks, "text": text, "engine": "remote",
+                "remote_engine": out.get("engine", ""), "cached": False}
+        if use_cache:
+            cache_save(cfg["cache_dir"], key, data)
+        return data
+
     import cv2
     img = cv2.imread(path)
     if img is None:
@@ -327,11 +452,102 @@ def ocr_image(path: str, cfg: dict = None, use_cache: bool = True) -> dict:
     return data
 
 
-def to_markdown(data: dict, label: str = "图片文字") -> str:
-    """把 OCR 结果渲染为 Markdown 引用块（可被 RAG 切分/检索）"""
+def _dup_fragment_pairs(lines: list) -> int:
+    """统计"一条是另一条严格前缀"的行对数量。
+
+    分块识别会在块接缝处把一句话切成两半，两半都被单独识别出来：
+    「1. 审查」与「1. 审查审批」、「5. 档案」与「5. 档案管理」并存。
+    这种伪影的**置信度往往很高**（两段都识别得很清楚），纯靠 score 抓不到，
+    只能靠文本形态判断。返回对数，供 quality_of 判低质量。
+    """
+    norm = [ln.strip() for ln in lines if len(ln.strip()) >= 2]
+    n = 0
+    for i, a in enumerate(norm):
+        for j, b in enumerate(norm):
+            if i != j and len(a) < len(b) and b.startswith(a):
+                n += 1
+                break
+    return n
+
+
+def quality_of(data: dict, cfg: dict = None) -> dict:
+    """评估一次 OCR 结果的可信度，供 MD 标注用。
+
+    返回 {"level": "ok"|"low"|"no_text"|"unknown", "detail": str, "score": float|None}
+
+    判据（按信息可得性降级）：
+    1. 有置信度（本地引擎会给每个文本块打分）→ 均值低于 low_quality_score 判 low；
+    2. 无置信度（远程引擎只回文本）→ 只看"大图零文字"这一种可靠信号判 no_text；
+    3. 其余视为 unknown（不做无依据的猜测）。
+
+    设计取舍：低质量图**不重试、不换模型**，只打标。
+    将来若确认必需，按标注清单统一补识别（届时可换 VLM 或更高精度引擎）。
+    """
+    cfg = cfg or default_config()
+    d = data or {}
+    if d.get("skipped") == "too_small":
+        return {"level": "unknown", "detail": "图片过小，已跳过", "score": None}
+    if d.get("error"):
+        return {"level": "no_text", "detail": "识别失败", "score": None}
+
+    blocks = d.get("blocks") or []
+    scores = [b.get("score") for b in blocks if isinstance(b.get("score"), (int, float))]
+    text = (d.get("text") or "").strip()
+    w, h = d.get("width") or 0, d.get("height") or 0
+    big = min(w, h) >= int(cfg.get("no_text_min_side", 200)) if (w and h) else False
+
+    # 分块接缝重复：即便置信度很高也要标注（否则 MD 里会出现半句噪声）
+    if text and d.get("tiled"):
+        pairs = _dup_fragment_pairs(text.splitlines())
+        if pairs >= 2:
+            return {"level": "low",
+                    "detail": "疑似分块重复碎片 %d 处" % pairs,
+                    "score": round(sum(scores) / len(scores), 3) if scores else None}
+
+    if text and scores:
+        mean = sum(scores) / len(scores)
+        thr = float(cfg.get("low_quality_score", 0.62))
+        if mean < thr:
+            return {"level": "low",
+                    "detail": "均置信度 %.2f < %.2f" % (mean, thr),
+                    "score": round(mean, 3)}
+        return {"level": "ok", "detail": "", "score": round(mean, 3)}
+
+    if not text and big:
+        return {"level": "no_text", "detail": "图片较大但未识别到文字", "score": None}
+    if text:
+        return {"level": "unknown", "detail": "", "score": None}
+    return {"level": "unknown", "detail": "", "score": None}
+
+
+_LOW_QUALITY_NOTE = {
+    "low": "⚠️ 图片文字识别质量偏低（{detail}），以下内容仅作检索线索，引用请核对原图。",
+    "no_text": "⚠️ {detail}：可能是纯图形（流程图/示意图），也可能识别失败。",
+}
+
+
+def to_markdown(data: dict, label: str = "图片文字", cfg: dict = None) -> str:
+    """把 OCR 结果渲染为 Markdown 引用块（可被 RAG 切分/检索）
+
+    cfg 提供 annotate_low_quality / low_quality_score 等标注参数；
+    不给则不标注（保持旧行为）。
+    """
     text = (data or {}).get("text", "") or ""
+    note = ""
+    if cfg and cfg.get("annotate_low_quality", False):
+        q = quality_of(data, cfg)
+        tpl = _LOW_QUALITY_NOTE.get(q["level"])
+        if tpl:
+            note = tpl.format(detail=q["detail"])
     if not text.strip():
+        if note:
+            return "{}\n> **［{}］**\n> {}\n{}".format(
+                _MARK_BEGIN, label, note, _MARK_END)
         return ""
     lines = [ln for ln in text.split("\n") if ln.strip()]
     body = "\n".join("> " + ln for ln in lines)
-    return "{}\n> **［{}］**\n{}\n{}".format(_MARK_BEGIN, label, body, _MARK_END)
+    head = "> **［{}］**".format(label)
+    if note:
+        head += "\n> " + note
+    return "{}\n{}\n{}\n{}".format(_MARK_BEGIN, head, body, _MARK_END)
+
