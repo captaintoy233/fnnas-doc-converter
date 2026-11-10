@@ -310,6 +310,25 @@ def _push_worker_loop():
 
             # 转换产物：一个源文件可能产出多个 md（CHM 章节/压缩包内文件），逐个推送
             files_to_push = task.output_files or ([md_rel_path] if task.markdown else [])
+            # 页级增量：只推送内容变化的页（未变化页已在知识库中，无需重嵌入/摘要）
+            pages_skipped_unchanged = 0
+            if getattr(task, "changed_pages", None) is not None and files_to_push:
+                changed_set = {p.replace("\\", "/") for p in task.changed_pages}
+                kept = [p for p in files_to_push if p.replace("\\", "/") in changed_set]
+                pages_skipped_unchanged = len(files_to_push) - len(kept)
+                files_to_push = kept
+                if not files_to_push:
+                    # 全部页无变化：视为已推送完成，不触发任何嵌入
+                    task.weknora_push = PUSH_PUSHED
+                    task.weknora_error = "页级增量：{} 页均未变化，跳过推送".format(
+                        pages_skipped_unchanged)
+                    try:
+                        get_registry().mark_pushed(source_path, "")
+                    except Exception:
+                        pass
+                    logger.info("页级增量跳过: %s (%d 页未变化)", source_path,
+                                pages_skipped_unchanged)
+                    continue
             if not files_to_push:
                 task.weknora_push = PUSH_FAILED
                 task.weknora_error = "无 Markdown 内容可推送"
@@ -325,6 +344,7 @@ def _push_worker_loop():
                 rec = reg.get(source_path)
                 old_docs = rec.get("output_docs") if rec else {}
                 replace = wk_cfg.get("delete_replaced", True) and not task.skipped
+                total_pages = len(files_to_push) + pages_skipped_unchanged
                 for out_rel in files_to_push:
                     out_rel = out_rel.replace("\\", "/")
                     out_path = output_dir / out_rel
@@ -371,7 +391,7 @@ def _push_worker_loop():
                     except Exception:
                         pass
                     logger.info("推送成功: %s (%d/%d 文件)%s", source_path,
-                                ok_count, len(files_to_push),
+                                ok_count, total_pages,
                                 " (全部重复跳过)" if all_duplicate
                                 else (" (含重复跳过)" if task.weknora_error else ""))
                 elif ok_count > 0 and not failed_detail:
@@ -383,7 +403,7 @@ def _push_worker_loop():
                     except Exception:
                         pass
                     logger.info("推送完成(部分重复): %s (%d/%d 文件)", source_path,
-                                ok_count, len(files_to_push))
+                                ok_count, total_pages)
                 else:
                     task.weknora_push = PUSH_FAILED
                     task.weknora_error = "; ".join(failed_detail[:3]) or "推送失败"
@@ -399,6 +419,7 @@ def _push_worker_loop():
                 doc_ids = []
                 failed_detail = []
                 reg = get_registry()
+                total_pages = len(files_to_push) + pages_skipped_unchanged
                 for out_rel in files_to_push:
                     out_rel = out_rel.replace("\\", "/")
                     out_path = output_dir / out_rel
@@ -445,7 +466,7 @@ def _push_worker_loop():
                     except Exception:
                         pass
                     logger.info("推送成功: %s (%d/%d 文件)%s", source_path,
-                                ok_count, len(files_to_push),
+                                ok_count, total_pages,
                                 " (全部重复跳过)" if all_dup
                                 else (" (含重复跳过)" if task.weknora_error else ""))
                 elif ok_count > 0 and not failed_detail:
@@ -456,7 +477,7 @@ def _push_worker_loop():
                     except Exception:
                         pass
                     logger.info("推送完成(部分重复): %s (%d/%d 文件)", source_path,
-                                ok_count, len(files_to_push))
+                                ok_count, total_pages)
                 else:
                     task.weknora_push = PUSH_FAILED
                     task.weknora_error = "; ".join(failed_detail[:3]) or "推送失败"
@@ -504,6 +525,7 @@ class BatchTask:
         self.skipped = False          # 增量跳过
         self.push_original = False    # 原文回退推送（无法转换时）
         self.output_files = []        # 全部输出的相对路径（多文件：CHM 章节/压缩包）
+        self.changed_pages = None     # 页级增量：None=全推；list=只推这些输出页
         self.weknora_push = PUSH_NONE
         self.weknora_doc_id = ""
         self.weknora_error = ""
@@ -671,6 +693,9 @@ def _convert_single(task: BatchTask, output_dir: Path, config: dict) -> BatchTas
                 # （HTML、CHM 等带图文档依赖该属性；不支持的转换器忽略即可）
                 if hasattr(cand, "assets_root"):
                     cand.assets_root = str(output_dir)
+                # 页级增量提示：多页转换器可读取旧页指纹，为未变化页复用缓存产物
+                if hasattr(cand, "prior_page_hashes"):
+                    cand.prior_page_hashes = dict((rec or {}).get("page_hashes") or {})
                 out_files = cand.convert_to_files(str(path), rel)
                 if out_files:
                     task.converter = cand.display_name
@@ -703,13 +728,40 @@ def _convert_single(task: BatchTask, output_dir: Path, config: dict) -> BatchTas
                 task.markdown = content
             task.result_length += len(content)
 
-        registry.record(
-            str(path), source_hash,
-            output_rel=primary_rel,
-            converted_hash=registry.sha256_of_text(task.markdown or ""),
-            status="converted",
-            output_files=task.output_files,
-        )
+        # 页级增量：多输出源（CHM/压缩包）逐页计算内容指纹，与旧记录比对。
+        # 只有新增/变化的页需要重新推送；未变化的页跳过嵌入与摘要。
+        # 注意：指纹从「已落盘文件」读回后计算 —— 写入/读取的换行规范化已在
+        # 转换器侧统一，此处读盘可保证与下次运行时读到的一致。
+        page_hashes = {}
+        for out_rel in task.output_files:
+            try:
+                content = (output_dir / out_rel).read_text(encoding="utf-8")
+                page_hashes[out_rel.replace("\\", "/")] = \
+                    registry.sha256_of_text(content)
+            except OSError:
+                pass
+        old_pages = (rec or {}).get("page_hashes") or {}
+        if len(task.output_files) > 1 and page_hashes:
+            changed = [r for r, h in page_hashes.items() if old_pages.get(r) != h]
+            if old_pages:
+                task.changed_pages = changed
+            # 更新语义：删除已消失页在知识库中的旧文档
+            wk_cfg = config.get("weknora", {})
+            gone = [r for r in old_pages if r not in page_hashes]
+            if gone and wk_cfg.get("delete_replaced", True):
+                try:
+                    client = _get_push_client(config)
+                    if client.is_configured():
+                        for gr in gone:
+                            old_id = ((rec or {}).get("output_docs") or {}).get(gr)
+                            if old_id:
+                                client.delete_knowledge(old_id)
+                except Exception as e:
+                    logger.warning("清理消失页失败 %s: %s", path, e)
+        registry.record(str(path), source_hash, output_rel=primary_rel,
+                        converted_hash=registry.sha256_of_text(task.markdown or ""),
+                        status="converted", output_files=task.output_files,
+                        page_hashes=page_hashes)
         task.status = STATUS_SUCCESS
     except Exception as e:
         task.status = STATUS_FAILED

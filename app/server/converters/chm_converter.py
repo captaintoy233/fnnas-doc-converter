@@ -194,6 +194,9 @@ class CHMConverter(ImagePipelineMixin, BaseConverter):
         # 大文档集用多进程绕开 GIL；阈值以下用线程（省去进程启动开销）
         self.render_processes = bool(render_processes)
         self.mp_threshold = int(mp_threshold)
+        # 页级增量：batch 层注入旧记录 {输出相对路径: 内容 sha256}，
+        # 未变化的页直接复用磁盘产物，跳过渲染与 OCR（CHM 定期更新场景）
+        self.prior_page_hashes = {}
         self._init_image_pipeline(image_mode=image_mode,
                                   image_max_mb=image_max_mb,
                                   assets_root=assets_root,
@@ -570,6 +573,15 @@ class CHMConverter(ImagePipelineMixin, BaseConverter):
 
         return re.sub(r"\]\(([^)\s]+)\)", repl, md)
 
+    # 换行归一：渲染结果里可能夹带孤立 \r（HTML 的 &#13; / 老式 Mac 换行）。
+    # 文本模式落盘后按通用换行读回会把 \r 变成 \n，导致「写出去的内容」与
+    # 「读回来的内容」哈希不一致 —— 页级增量会误判为内容变化而反复重渲染。
+    _CRLF_RE = re.compile(r"\r\n?")
+
+    @classmethod
+    def _normalize_newlines(cls, s: str) -> str:
+        return cls._CRLF_RE.sub("\n", s) if "\r" in s else s
+
     def render_document(self, doc: dict, chm_name: str = "",
                         link_map: dict = None, img_stats: dict = None) -> str:
         """将文档条目渲染为带元数据的 Markdown
@@ -599,7 +611,7 @@ class CHMConverter(ImagePipelineMixin, BaseConverter):
                     + body)
 
         if not self.front_matter:
-            return body
+            return self._normalize_newlines(body)
 
         meta = {
             "title": doc["title"],
@@ -609,7 +621,7 @@ class CHMConverter(ImagePipelineMixin, BaseConverter):
             "source_files": [os.path.basename(f) for f in doc["source_files"]],
             "content_hash": doc["source_hash"],
         }
-        return _front_matter(meta) + body
+        return self._normalize_newlines(_front_matter(meta) + body)
 
     def convert_tree_to_files(self, file_path: str, rel_path: str,
                               chm_name: str = "", docs: list = None,
@@ -653,6 +665,43 @@ class CHMConverter(ImagePipelineMixin, BaseConverter):
 
             link_map = self.build_link_map(out_docs)
 
+            # 页级增量：与旧记录内容指纹比对，未变化的页直接复用磁盘产物，
+            # 跳过渲染（CHM 定期更新时只有少数制度变化 → 秒级完成）
+            prior = getattr(self, "prior_page_hashes", None) or {}
+            reused = []
+            reuse_missing = reuse_changed = 0
+            if prior and getattr(self, "assets_root", ""):
+                rest = []
+                for d in out_docs:
+                    old_h = prior.get(d["rel_path"])
+                    if not old_h:
+                        rest.append(d)
+                        reuse_missing += 1
+                        continue
+                    md_path = Path(self.assets_root) / d["rel_path"]
+                    try:
+                        content = md_path.read_text(encoding="utf-8")
+                    except OSError as e:
+                        logger.debug("CHM 页复用失败(读不到产物) %s: %s",
+                                     d["rel_path"], e)
+                        rest.append(d)
+                        reuse_missing += 1
+                        continue
+                    if hashlib.sha256(content.encode("utf-8")).hexdigest() == old_h:
+                        reused.append((d["rel_path"], content))
+                    else:
+                        logger.info("CHM 页内容已变化，重渲染: %s", d["rel_path"])
+                        rest.append(d)
+                        reuse_changed += 1
+                out_docs = rest
+                if reused:
+                    logger.info("CHM 页级增量：%s 复用 %d 页、重渲染 %d 页"
+                                "（内容变化 %d / 无旧产物 %d）",
+                                Path(file_path).name, len(reused), len(out_docs),
+                                reuse_changed, reuse_missing)
+
+            outputs = list(reused)
+
             # 大文档集走多进程（绕开 GIL）；小批量用线程避免进程启动开销
             if self.render_processes and len(out_docs) >= self.mp_threshold:
                 conv_kwargs = dict(
@@ -665,7 +714,6 @@ class CHMConverter(ImagePipelineMixin, BaseConverter):
                     namespace_output=self.namespace_output,
                     skip_scaffold=self.skip_scaffold,
                 )
-                outputs = []
                 with ProcessPoolExecutor(
                     max_workers=max(1, self.workers),
                     initializer=_mp_render_init,
@@ -684,7 +732,6 @@ class CHMConverter(ImagePipelineMixin, BaseConverter):
                     lambda d: self.render_document(d, chm_name, link_map), out_docs
                 ))
 
-            outputs = []
             for d, content in zip(out_docs, contents):
                 if content and content.strip():
                     outputs.append((d["rel_path"], content))

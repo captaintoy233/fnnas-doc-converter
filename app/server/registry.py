@@ -100,8 +100,12 @@ class SyncRegistry:
                converted_hash: str = "", status: str = "converted",
                pushed: bool = False, weknora_doc_id: str = "",
                error: str = "", output_files: list = None,
-               render_version: str = None):
-        """记录一次转换结果"""
+               render_version: str = None, page_hashes: dict = None):
+        """记录一次转换结果
+
+        page_hashes: {输出相对路径: 内容 sha256}，用于 CHM/压缩包等多页源的
+                     **页级增量**——重转后逐页比对，只有变化的页才重新推送。
+        """
         out_files = output_files if output_files else ([output_rel] if output_rel else [])
         rec = {
             "source_hash": source_hash,
@@ -114,6 +118,7 @@ class SyncRegistry:
             "output_docs": {},          # {输出相对路径: WeKnora doc_id}（更新语义用）
             "error": error,
             "render_version": RENDER_VERSION if render_version is None else render_version,
+            "page_hashes": page_hashes or {},
             "converted_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
         # 保留旧 output_docs（增量更新不丢失已推送文档的 doc_id）
@@ -141,6 +146,14 @@ class SyncRegistry:
                 rec.setdefault("output_docs", {})[output_rel] = doc_id
                 rec["pushed"] = True
                 rec["pushed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+                self._save()
+
+    def set_page_hash(self, file_path: str, output_rel: str, content_hash: str):
+        """记录某一输出页的内容指纹（页级增量推送的依据）"""
+        with self._lock:
+            rec = self._data.get(str(file_path))
+            if rec:
+                rec.setdefault("page_hashes", {})[output_rel] = content_hash
                 self._save()
 
     def delete(self, file_path: str):
@@ -188,6 +201,7 @@ class SqliteSyncRegistry:
         pushed          INTEGER DEFAULT 0,
         weknora_doc_id  TEXT,
         output_docs     TEXT,
+        page_hashes     TEXT,
         error           TEXT,
         converted_at    TEXT,
         pushed_at       TEXT,
@@ -209,7 +223,8 @@ class SqliteSyncRegistry:
                 "output_rel": "TEXT", "output_files": "TEXT",
                 "converted_hash": "TEXT", "status": "TEXT",
                 "pushed": "INTEGER DEFAULT 0", "weknora_doc_id": "TEXT",
-                "output_docs": "TEXT", "error": "TEXT",
+                "output_docs": "TEXT", "page_hashes": "TEXT",
+                "error": "TEXT",
                 "converted_at": "TEXT", "pushed_at": "TEXT",
                 "render_version": "TEXT",
             }
@@ -236,8 +251,8 @@ class SqliteSyncRegistry:
 
     _COLS = ("file_path", "source_hash", "output_rel", "output_files",
              "converted_hash", "status", "pushed", "weknora_doc_id",
-             "output_docs", "error", "converted_at", "pushed_at",
-             "render_version")
+             "output_docs", "page_hashes", "error", "converted_at",
+             "pushed_at", "render_version")
     _COL_SQL = ", ".join(_COLS)
 
     def _row_to_dict(self, row) -> dict:
@@ -252,6 +267,10 @@ class SqliteSyncRegistry:
             d["output_docs"] = json.loads(d.get("output_docs") or "{}")
         except Exception:
             d["output_docs"] = {}
+        try:
+            d["page_hashes"] = json.loads(d.get("page_hashes") or "{}")
+        except Exception:
+            d["page_hashes"] = {}
         d["pushed"] = bool(d.get("pushed"))
         return d
 
@@ -288,19 +307,20 @@ class SqliteSyncRegistry:
                converted_hash: str = "", status: str = "converted",
                pushed: bool = False, weknora_doc_id: str = "",
                error: str = "", output_files: list = None,
-               render_version: str = None):
+               render_version: str = None, page_hashes: dict = None):
         out_files = output_files if output_files else ([output_rel] if output_rel else [])
         # 保留旧 output_docs（增量更新不丢失已推送文档的 doc_id）
         old = self.get(file_path)
         old_docs = old.get("output_docs") or {}
+        pages = page_hashes if page_hashes is not None else (old.get("page_hashes") or {})
         with self._lock:
             conn = self._conn()
             try:
                 conn.execute(
                     """INSERT INTO registry (file_path, source_hash, output_rel, output_files,
                        converted_hash, status, pushed, weknora_doc_id, output_docs,
-                       error, converted_at, render_version)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                       page_hashes, error, converted_at, render_version)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
                        ON CONFLICT(file_path) DO UPDATE SET
                          source_hash=excluded.source_hash,
                          output_rel=excluded.output_rel,
@@ -310,6 +330,7 @@ class SqliteSyncRegistry:
                          pushed=excluded.pushed,
                          weknora_doc_id=excluded.weknora_doc_id,
                          output_docs=excluded.output_docs,
+                         page_hashes=excluded.page_hashes,
                          error=excluded.error,
                          converted_at=excluded.converted_at,
                          render_version=excluded.render_version""",
@@ -318,6 +339,7 @@ class SqliteSyncRegistry:
                      converted_hash, status, 1 if pushed else 0,
                      weknora_doc_id,
                      json.dumps(old_docs, ensure_ascii=False),
+                     json.dumps(pages, ensure_ascii=False),
                      error, time.strftime("%Y-%m-%dT%H:%M:%S"),
                      RENDER_VERSION if render_version is None else render_version))
                 conn.commit()
@@ -349,6 +371,21 @@ class SqliteSyncRegistry:
                     "WHERE file_path=?",
                     (json.dumps(docs, ensure_ascii=False),
                      time.strftime("%Y-%m-%dT%H:%M:%S"), self._key(file_path)))
+                conn.commit()
+            finally:
+                conn.close()
+
+    def set_page_hash(self, file_path: str, output_rel: str, content_hash: str):
+        """记录某一输出页的内容指纹（页级增量推送的依据）"""
+        rec = self.get(file_path)
+        pages = rec.get("page_hashes") or {}
+        pages[output_rel] = content_hash
+        with self._lock:
+            conn = self._conn()
+            try:
+                conn.execute(
+                    "UPDATE registry SET page_hashes=? WHERE file_path=?",
+                    (json.dumps(pages, ensure_ascii=False), self._key(file_path)))
                 conn.commit()
             finally:
                 conn.close()

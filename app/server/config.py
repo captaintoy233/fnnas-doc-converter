@@ -7,12 +7,12 @@ from pathlib import Path
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 # 渲染版本：**仅当转换逻辑变更会改变输出内容时**递增（与 APP_VERSION 解耦）。
 # 注册表会记录每次转换时的该值，不一致即重新转换。
 # 没有它的话，升级后源文件哈希没变，老输出会被增量永久跳过——
 # v2.2.0 修复的丢图问题正是这种情况：代码换了但产物没重生成。
-RENDER_VERSION = "2.2.0"
+RENDER_VERSION = "2.3.0"
 APP_NAME = "DocConverter"
 
 CONFIG_PATHS = [
@@ -135,7 +135,15 @@ DEFAULT_CONFIG = {
     },
     "ocr": {
         "enabled": False,               # 是否对图片做 OCR 并把文字注入 MD
-        "backend": "rapidocr",          # 纯 CPU / ONNX Runtime
+        "backend": "rapidocr",          # rapidocr(本地 CPU) | remote(HTTP 远程引擎，如 GPU 主机)
+        # 远程 OCR 服务（backend=remote）：对接 app/server/serve_ocr.py 协议，
+        # 任何实现该协议的引擎（PaddleOCR-GPU / PaddleOCR-VL / RapidOCR-Server…）均可接入
+        "remote": {
+            "url": "",                  # 如 http://100.81.98.0:8890/ocr
+            "token": "",                # Bearer 令牌，与 serve_ocr --token 一致
+            "timeout": 300,
+            "send_b64": False,          # true=跨机 base64 传图；false=同机共享卷路径
+        },
         "cache_dir": "~/.cache/docconverter/ocr",
         "intra_op_num_threads": 2,      # 进程数 × 该值 ≈ 物理核数
         "tile_threshold": 960,          # 最长边超过则分块（避免缩放漏检小字）
@@ -149,6 +157,10 @@ DEFAULT_CONFIG = {
         "placeholder_missing": True,    # 图片缺失时写占位文本而非死引用
         # 常驻服务（容器批处理）无独立 OCR 预处理阶段，需开启内联回退
         "inline_fallback": False,
+        # ── 质量标注（GPU 资源紧张时不做重试，只在 MD 里打标，便于日后统一补识别）──
+        "annotate_low_quality": True,
+        "low_quality_score": 0.62,
+        "no_text_min_side": 200,
     },
     "htm": {
         # HTML 图片处理：留空则跟随 ocr.enabled（启用 OCR 时用 link）
@@ -230,6 +242,13 @@ ENV_MAP = [
     ("OCR_TILE_THRESHOLD", ["ocr", "tile_threshold"], int),
     ("OCR_MIN_IMAGE_SIDE", ["ocr", "min_image_side"], int),
     ("OCR_INLINE_FALLBACK", ["ocr", "inline_fallback"], bool),
+    ("OCR_REMOTE_URL", ["ocr", "remote", "url"], str),
+    ("OCR_REMOTE_TOKEN", ["ocr", "remote", "token"], str),
+    ("OCR_REMOTE_TIMEOUT", ["ocr", "remote", "timeout"], int),
+    ("OCR_REMOTE_B64", ["ocr", "remote", "send_b64"], bool),
+    ("OCR_ANNOTATE_LOW_QUALITY", ["ocr", "annotate_low_quality"], bool),
+    ("OCR_LOW_QUALITY_SCORE", ["ocr", "low_quality_score"], float),
+    ("OCR_NO_TEXT_MIN_SIDE", ["ocr", "no_text_min_side"], int),
     ("CONVERTER_REGISTRY_PATH", ["registry", "path"], str),
     ("REGISTRY_HANDLE_MISSING", ["registry", "handle_missing"], bool),
     ("ARCHIVE_DIR", ["archive", "dir"], str),
