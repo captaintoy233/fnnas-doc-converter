@@ -273,6 +273,7 @@ def list_7z_entries(archive: Path, seven_zip: str) -> list:
         proc = subprocess.run(
             [seven_zip, "l", "-slt", str(archive)],
             capture_output=True, text=True, timeout=600,
+            stdin=subprocess.DEVNULL,  # 加密归档防密码提示挂起
         )
     except Exception:
         return []
@@ -307,6 +308,9 @@ def extract_7z(archive: Path, dest: Path, seven_zip: str) -> list:
     proc = subprocess.run(
         [seven_zip, "x", "-y", "-o{}".format(dest), str(archive)],
         capture_output=True, text=True, timeout=900,
+        # 加密归档会让 7z 交互式询问密码并读 stdin —— 必须掐断，
+        # 否则密码提示挂起（capture_output 下 stderr 管道也吸不走 prompt）
+        stdin=subprocess.DEVNULL,
     )
 
     extracted_files = {str(p) for p in dest.rglob("*") if p.is_file()}
