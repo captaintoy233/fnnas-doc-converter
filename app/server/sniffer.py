@@ -95,10 +95,11 @@ def sniff_format(path) -> tuple:
         (ext, name): 如 ('.docx', 'DOCX')；无法识别时回退扩展名
     """
     try:
+        real_ext_hint = Path(path).suffix.lower()  # 已知扩展名：嗅探结果与之冲突时优先尊重已知语义
         with open(path, 'rb') as f:
             head = f.read(4096)
             if not head:
-                return (Path(path).suffix.lower() or '.bin', 'UNKNOWN')
+                return (real_ext_hint or '.bin', 'UNKNOWN')
 
             # CHM (ITS 格式)
             if head[:4] == b'ITSF':
@@ -114,7 +115,14 @@ def sniff_format(path) -> tuple:
 
             # OLE2 复合文档 (doc/xls/ppt/wps/et/dps)
             if head[:8] == b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1':
-                return _sniff_cfb(f)
+                ext, name = _sniff_cfb(f)
+                # WPS 表格 .et 与 .xls 同为 OLE2+Workbook/Book 流，嗅探无法区分。
+                # 若嗅探成 .xls 而真实扩展名是 .et，归还 .et（xlrd 兼容 BIFF，
+                # 由 ETConverter 处理；否则会误路由 LibreOfficeConverter 且其
+                # 纯 Python 回退链没有 .et 分支，直接抛 No fallback）。
+                if ext == '.xls' and real_ext_hint == '.et':
+                    return '.et', 'ET'
+                return ext, name
 
             # RTF (完整签名检查)
             if head[:5] == b'{\\rtf':
