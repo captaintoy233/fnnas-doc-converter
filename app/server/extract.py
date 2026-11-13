@@ -72,9 +72,53 @@ def _fix_zip_name(name: str, flag_bits: int) -> str:
         return name
 
 
+def _read_local_header_name(path: Path, info) -> bytes:
+    """读取成员本地头中的原始文件名字节（中央目录可能与之不一致）。"""
+    import struct
+    try:
+        with open(path, "rb") as f:
+            f.seek(info.header_offset)
+            head = f.read(30)
+            if len(head) < 30 or head[:4] != b"PK\x03\x04":
+                return None
+            fname_len, _extra_len = struct.unpack("<HH", head[26:30])
+            return f.read(fname_len)
+    except Exception:
+        return None
+
+
+def _open_zip_member_forgiving(zf, archive: Path, info):
+    """打开 zip 成员，容忍中央目录与本地头文件名不一致的畸形包。
+
+    zipfile 在 open() 时严格校验两个名字解码后相等；Windows 下有些压缩
+    工具会把中央目录写成 GBK、本地头写成 UTF-8（或反之），正常成员必然
+    校验失败。此处按本地头自己的 flag bit 11 重算解码串，临时替换
+    orig_filename 通过校验后读数据，读完恢复原值。
+    """
+    try:
+        return zf.open(info)
+    except zipfile.BadZipFile as e:
+        if "differ" not in str(e):
+            raise
+    raw = _read_local_header_name(archive, info)
+    if not raw:
+        raise
+    if info.flag_bits & 0x800:          # 本地头 flag bit 11: UTF-8 名
+        hdr_name = raw.decode("utf-8")
+    else:
+        hdr_name = raw.decode("cp437")
+    orig_filename, orig_of = info.filename, info.orig_filename
+    try:
+        info.filename = info.orig_filename = hdr_name
+        return zf.open(info)
+    finally:
+        info.filename, info.orig_filename = orig_filename, orig_of
+
+
 def extract_zip(archive: Path, dest: Path, config=None) -> list:
     max_bytes, max_entries = _extract_limits(config)
     out = []
+    failed = []
     count = 0
     size_acc = 0
     with zipfile.ZipFile(archive) as zf:
@@ -94,9 +138,33 @@ def extract_zip(archive: Path, dest: Path, config=None) -> list:
                 target.mkdir(parents=True, exist_ok=True)
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
-            with zf.open(info) as src, open(target, "wb") as dst:
-                shutil.copyfileobj(src, dst)
-            out.append(str(target))
+            # 单成员解压失败（如 GBK zip 的中央目录/本地头文件名不一致，
+            # zipfile 严格校验抛 BadZipFile）只记账跳过，不炸整包
+            try:
+                with _open_zip_member_forgiving(zf, archive, info) as src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                out.append(str(target))
+                continue
+            except zipfile.BadZipFile as e:
+                failed.append((name, e))
+            except Exception as e:  # noqa: BLE001
+                failed.append((name, e))
+    if failed:
+        # 有失败条目（畸形 zip / 超长名等）→ 回退外部 7-Zip 重解整个包。
+        # 7z 对畸形 zip（中央目录/本地头编码不一致等）宽容得多。
+        seven_zip = None
+        try:
+            cfg = config or {}
+            seven_zip = (cfg.get("archive", {}) or {}).get("seven_zip_path", "7zz")
+        except Exception:
+            pass
+        found = shutil.which(seven_zip or "7zz") or shutil.which("7z")
+        if found:
+            logger.warning("zipfile 解压 %d 个条目失败，回退 7zz 重解: %s",
+                           len(failed), archive.name)
+            return extract_7z(archive, dest, found)
+        for name, e in failed:
+            print("WARN extract member failed: {} ({}: {})".format(name, type(e).__name__, e))
     return out
 
 
@@ -205,6 +273,7 @@ def list_7z_entries(archive: Path, seven_zip: str) -> list:
         proc = subprocess.run(
             [seven_zip, "l", "-slt", str(archive)],
             capture_output=True, text=True, timeout=600,
+            stdin=subprocess.DEVNULL,  # 加密归档防密码提示挂起
         )
     except Exception:
         return []
@@ -239,6 +308,9 @@ def extract_7z(archive: Path, dest: Path, seven_zip: str) -> list:
     proc = subprocess.run(
         [seven_zip, "x", "-y", "-o{}".format(dest), str(archive)],
         capture_output=True, text=True, timeout=900,
+        # 加密归档会让 7z 交互式询问密码并读 stdin —— 必须掐断，
+        # 否则密码提示挂起（capture_output 下 stderr 管道也吸不走 prompt）
+        stdin=subprocess.DEVNULL,
     )
 
     extracted_files = {str(p) for p in dest.rglob("*") if p.is_file()}
@@ -313,7 +385,17 @@ def extract_archive(archive_path: str, dest_dir: str, config=None) -> list:
 
     ext = archive.suffix.lower()
     if ext == ".zip":
-        return extract_zip(archive, dest, config)
+        try:
+            return extract_zip(archive, dest, config)
+        except zipfile.BadZipFile:
+            # 畸形 zip（如中央目录 GBK / 本地头 UTF-8 名不一致）zipfile
+            # 严格校验必炸。配置了 7zz 时回退外部 7-Zip 重解（对畸形包容错）。
+            seven_zip = (config.get("archive", {}) or {}).get("seven_zip_path", "7zz")
+            found = shutil.which(seven_zip) or shutil.which("7z")
+            if not found:
+                raise
+            logger.warning("zipfile 解压失败，回退 7zz 重解: %s", archive.name)
+            return extract_7z(archive, dest, found)
     if ext in SINGLE_EXTS:
         return extract_single(archive, dest, ext, config)
     if ext in (".rar", ".7z"):
