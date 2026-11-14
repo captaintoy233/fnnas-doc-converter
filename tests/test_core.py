@@ -1,9 +1,14 @@
 """路径映射 / 嗅探器 / 注册表 测试"""
 import json
 import os
+import sys
 from pathlib import Path
 
+import pytest
 
+
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="WSL 部署形态的盘符映射（/mnt/c），Windows 本机不适用")
 def test_windows_path_mapping():
     from paths import to_local_path
     cfg = {"converter": {"drive_map": {"C:": "/mnt/c"}}}
@@ -83,7 +88,7 @@ def test_zip_extract_slip_protection(tmp_path):
     dest = tmp_path / "out"
     dest.mkdir()
     files = extract_zip(archive, dest)
-    names = [str(Path(f).relative_to(dest)) for f in files]
+    names = [str(Path(f).relative_to(dest)).replace("\\", "/") for f in files]
     assert "ok/file.txt" in names
     assert not (tmp_path / "evil.txt").exists()
 

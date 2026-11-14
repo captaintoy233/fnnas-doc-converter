@@ -88,7 +88,10 @@ class ArchiveConverter(BaseConverter):
                 for ef in extracted:
                     ef_path = Path(ef)
                     try:
-                        ef_rel = ef_path.relative_to(tmp)
+                        # Windows 8.3 短文件名：resolve 归一后再比较，防止
+                        # EXAMPL~1 vs exampleuser-V100 误判为 zip slip 逃逸；
+                        # 同时把 relative_to 的反斜杠统一为 POSIX 风格。
+                        ef_rel = str(ef_path.resolve().relative_to(Path(tmp).resolve())).replace("\\", "/")
                     except ValueError:
                         continue
                     results.extend(self._convert_inner(
@@ -124,6 +127,8 @@ class ArchiveConverter(BaseConverter):
                     continue
                 for out_rel, content in outputs:
                     full_rel = "{}/{}".format(archive_stem, out_rel)
+                    # 各转换器在 Windows 下可能产出反斜杠 rel，统一 POSIX 风格
+                    full_rel = full_rel.replace("\\", "/")
                     if full_rel in seen:
                         full_rel = "{}/{}".format(full_rel, "_dup")
                     results.append((full_rel, content))
@@ -155,7 +160,8 @@ class ArchiveConverter(BaseConverter):
             for ef in extracted:
                 ef_path = Path(ef)
                 try:
-                    ef_rel = str(ef_path.relative_to(base))
+                    # Windows 8.3 短文件名防护 + 反斜杠归一（同上）
+                    ef_rel = str(ef_path.resolve().relative_to(Path(base).resolve())).replace("\\", "/")
                 except ValueError:
                     continue
                 outputs.extend(self._convert_inner(
@@ -172,7 +178,7 @@ class ArchiveConverter(BaseConverter):
             ]
             for ef in sorted(extracted):
                 manifest_lines.append("| {} | 已处理 |".format(
-                    str(Path(ef).relative_to(base)).replace("\\", "/")))
+                    str(Path(ef).resolve().relative_to(Path(base).resolve())).replace("\\", "/")))
             manifest = "\n".join(manifest_lines) + "\n"
             outputs.append(("{}/_归档清单.md".format(archive_stem), manifest))
             return outputs

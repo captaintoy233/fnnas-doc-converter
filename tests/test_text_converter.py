@@ -13,7 +13,7 @@ def test_md_passthrough_is_byte_identical(tmp_path):
     """已是 Markdown 的文件必须原样透传，二次渲染会损伤格式"""
     content = "# 标题\n\n- 列表项\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\n```py\nx=1\n```\n"
     p = tmp_path / "doc.md"
-    p.write_text(content, encoding="utf-8")
+    p.write_text(content, encoding="utf-8", newline="")  # 避免 Windows 写出 CRLF 破坏逐字节断言
     assert TextConverter().convert(str(p)) == content
 
 

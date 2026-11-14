@@ -319,7 +319,9 @@ def load_config() -> dict:
     # 1. 尝试加载 YAML 配置文件
     for path in _config_paths():
         if path.exists():
-            with open(path) as f:
+            # 显式 UTF-8：Windows 默认 locale（GBK）会把含中文的 UTF-8 配置
+            # 解码失败，except 吞掉后整个 YAML 被丢弃，凭据全部回退默认空值
+            with open(path, encoding="utf-8") as f:
                 try:
                     yaml_config = yaml.safe_load(f)
                     if isinstance(yaml_config, dict):

@@ -95,4 +95,6 @@ class TextConverter(BaseConverter):
             out_rel = str(p)                     # 本来就是 .md，名字不变
         else:
             out_rel = str(p.with_name(p.stem + ext + ".md"))
+        # Windows 下 str(p) 会产生反斜杠，输出 rel 统一 POSIX 风格
+        out_rel = out_rel.replace("\\", "/")
         return [(out_rel, self.convert(file_path))]
