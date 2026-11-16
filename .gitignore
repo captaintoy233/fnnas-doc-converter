@@ -21,3 +21,5 @@ tests/fixtures_corpus/
 bench/out/
 bench/scores.csv
 bench/frozen_scores.json
+bench/l2_results.csv
+logs_*.txt
