@@ -177,6 +177,7 @@ def blind_compare(md: str, naive: str) -> dict:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pilot", type=int, default=0, help="抽样 N 份跨格式试点")
+    ap.add_argument("--redo", default="", help="重判文件名以此前缀开头的条目（先剔除旧结果再评）")
     args = ap.parse_args()
 
     if not API_KEY:
@@ -212,9 +213,13 @@ def main():
     wins = {"md": 0, "naive": 0, "tie": 0, "inconsistent": 0}
     # 增量：跳过已评过的文件（读现有结果），避免重复消耗推理
     judged = set()
+    old_rows = []
     if RESULTS.exists():
         with open(RESULTS, encoding="utf-8-sig") as fh:
-            judged = {r["file"] for r in csv.DictReader(fh)}
+            old_rows = list(csv.DictReader(fh))
+        judged = {r["file"] for r in old_rows}
+    if args.redo:
+        judged = {f for f in judged if not f.startswith(args.redo)}
     for name, path in usable:
         if name in judged:
             continue
@@ -239,12 +244,22 @@ def main():
         print("%-24s -> %-12s (r1=%s r2=%s) %ss" %
               (name, res["winner"], res["r1"]["winner"], res["r2"]["winner"], dt))
 
-    new_file = not RESULTS.exists()
-    with open(RESULTS, "a", newline="", encoding="utf-8-sig") as fh:
-        w = csv.writer(fh)
-        if new_file:
-            w.writerow(["file", "winner", "consistent", "round1", "round2", "reason", "seconds"])
-        w.writerows(rows)
+    header = ["file", "winner", "consistent", "round1", "round2", "reason", "seconds"]
+    if args.redo:
+        keep = [r for r in old_rows if not r["file"].startswith(args.redo)]
+        with open(RESULTS, "w", newline="", encoding="utf-8-sig") as fh:
+            w = csv.writer(fh)
+            w.writerow(header)
+            for r in keep:
+                w.writerow([r.get(h, "") for h in header])
+            w.writerows(rows)
+    else:
+        new_file = not RESULTS.exists()
+        with open(RESULTS, "a", newline="", encoding="utf-8-sig") as fh:
+            w = csv.writer(fh)
+            if new_file:
+                w.writerow(header)
+            w.writerows(rows)
     n = len(rows)
     print("\n=== L2 盲评汇总（%d 份）===" % n)
     for k in ("md", "naive", "tie", "inconsistent"):
