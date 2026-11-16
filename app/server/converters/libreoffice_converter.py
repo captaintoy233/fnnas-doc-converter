@@ -163,52 +163,14 @@ class LibreOfficeConverter(BaseConverter):
     # ------------------------------------------------------------------
 
     def _fallback_doc(self, file_path: str) -> str:
-        """纯 Python .doc 文本提取（OLE2 WordDocument 流）"""
-        import olefile
-        import struct
+        """纯 Python .doc 文本提取。
 
-        try:
-            ole = olefile.OleFileIO(file_path)
-        except Exception as e:
-            raise MalformedDocumentError(
-                f"Cannot open .doc file: {e}", file_path=file_path
-            ) from e
-
-        try:
-            wd = ole.openstream('WordDocument').read()
-        except Exception:
-            ole.close()
-            raise MalformedDocumentError(
-                "No WordDocument stream in .doc file", file_path=file_path
-            )
-
-        ole.close()
-
-        # 尝试 FIB 定位正文
-        text = ""
-        try:
-            if len(wd) >= 0x20:
-                flags = wd[0x0A]
-                f_complex = bool(flags & 0x04)
-                fc_min, fc_mac = struct.unpack_from('<II', wd, 0x18)
-                if not f_complex and fc_mac > fc_min and fc_mac <= len(wd):
-                    raw = wd[fc_min:fc_mac]
-                    text = raw.decode('utf-16-le', errors='replace')
-        except Exception:
-            pass
-
-        # 回退：全文 UTF-16LE 解码 + CJK 定位
-        if len(text.strip()) < 10:
-            decoded = wd.decode('utf-16-le', errors='replace')
-            match = re.search(r'[\u4e00-\u9fff]{4,}', decoded)
-            text = decoded[match.start():] if match else decoded
-
-        # 清理控制字符
-        text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text)
-        text = text.replace('\r\n', '\n').replace('\r', '\n')
-        text = re.sub(r'[ \t]+\n', '\n', text)
-        text = re.sub(r'\n{3,}', '\n\n', text)
-        return text.strip()
+        .doc 与 .wps 同为 OLE2 WordDocument 二进制格式，复用 WPSConverter 的
+        piece table 抽取（只取真正正文片，消除旧 fcMin/fcMac+启发式对 fComplex
+        文档产生的尾部二进制乱码）。OLE 打开失败抛 MalformedDocumentError。
+        """
+        from .wps import WPSConverter
+        return WPSConverter()._extract_text(file_path)
 
     def _fallback_xls(self, file_path: str) -> str:
         """纯 Python .xls 表格提取（xlrd）"""
