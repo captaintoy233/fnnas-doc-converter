@@ -45,6 +45,9 @@ MODEL = os.environ.get("L2_MODEL", "local-27b")
 API_KEY = os.environ.get("L2_API_KEY", "")
 CHAR_CAP = int(os.environ.get("L2_CHAR_CAP", "6000"))
 MAX_TOKENS = int(os.environ.get("L2_MAX_TOKENS", "2500"))
+# 思考模型对含二进制乱码的输入易退化推理循环（单轮 >180s）。L2_NO_THINK=1 关闭
+# 思考链直接出 JSON，大幅提速；垃圾检测/结构对比这类显性判断无需深度推理。
+NO_THINK = os.environ.get("L2_NO_THINK", "0") == "1"
 
 RUBRIC = (
     "你是文档转换质量评审。下面给出同一份源文档的两个转换版本（文本A、文本B），"
@@ -212,7 +215,8 @@ def _call_judge(first: str, second: str, first_label: str, second_label: str) ->
                            headers={"Authorization": "Bearer " + API_KEY},
                            json={"model": MODEL,
                                  "messages": [{"role": "user", "content": prompt}],
-                                 "max_tokens": MAX_TOKENS, "temperature": 0},
+                                 "max_tokens": MAX_TOKENS, "temperature": 0,
+                                 "chat_template_kwargs": {"enable_thinking": not NO_THINK}},
                            timeout=180)
             r.raise_for_status()
             break
