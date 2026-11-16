@@ -10,6 +10,10 @@ build/
 test_samples/*.docx
 test_samples/*.ofd
 test_samples/*.wps
+# 合成测试样例（纯虚构，可随仓发布；由 tests/generate_samples.py 复现）
+!test_samples/test_sample.docx
+!test_samples/test_sample.ofd
+!test_samples/test_sample.wps
 _ref/
 data/
 *.log
