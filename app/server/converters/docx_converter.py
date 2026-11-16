@@ -10,9 +10,11 @@
 - 新增 convert_to_document() 返回 Document Model
 """
 from docx import Document as DocxDoc
+import zipfile
 from docx.table import Table
 from docx.text.paragraph import Paragraph
 from . import BaseConverter
+from errors import MalformedDocumentError
 
 # Document Model 导入
 from model.document import Document
@@ -114,7 +116,21 @@ class DOCXConverter(BaseConverter):
 
     def convert_to_document(self, file_path: str, **kwargs) -> Document:
         """转换为统一文档模型"""
-        doc = DocxDoc(file_path)
+        try:
+            doc = DocxDoc(file_path)
+        except zipfile.BadZipFile as e:
+            raise MalformedDocumentError(
+                f"Cannot open docx (not a valid OOXML zip): {e}",
+                file_path=file_path,
+            ) from e
+        except Exception as e:
+            # python-docx 对空文件抛 PackageNotFoundError；损坏 zip 内容抛
+            # BadZipFile/OSError（zip 内部条目截断时 seek 报 Errno 22）——
+            # 全部归一为 MalformedDocumentError，不让裸异常漏出转换边界
+            raise MalformedDocumentError(
+                f"Cannot open docx: {type(e).__name__}: {e}",
+                file_path=file_path,
+            ) from e
         result = Document()
         
         pending_empty = False  # 跟踪空段落，避免连续空行

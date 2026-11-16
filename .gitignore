@@ -15,3 +15,9 @@ data/
 *.log
 /converter.yaml
 .bak-*
+
+# 提质基准：业务语料与生成产物只留本地，不进公开仓库
+tests/fixtures_corpus/
+bench/out/
+bench/scores.csv
+bench/frozen_scores.json

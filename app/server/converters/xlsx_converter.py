@@ -9,8 +9,11 @@
 - 新增 convert_to_document() 返回 Document Model
 """
 import openpyxl
+import os
+import zipfile
 from datetime import datetime, date
 from . import BaseConverter
+from errors import MalformedDocumentError
 
 # Document Model 导入
 from model.document import Document
@@ -45,8 +48,40 @@ class XLSXConverter(BaseConverter):
         """转换为统一文档模型（带规模护栏：只读流式 + 行列/字符上限）"""
         from .spreadsheet_limits import get_limits, SheetBudget
         limits = get_limits()
-        wb = openpyxl.load_workbook(
-            file_path, data_only=True, read_only=bool(limits.get("read_only", True)))
+        load_path = file_path
+        tmp_copy = None
+        try:
+            try:
+                wb = openpyxl.load_workbook(
+                    load_path, data_only=True, read_only=bool(limits.get("read_only", True)))
+            except openpyxl.utils.exceptions.InvalidFileException:
+                # openpyxl 按扩展名白名单拒绝（如 .et 实为 xlsx 包）。
+                # 嗅探已确认是 PK 系 zip，复制到 .xlsx 临时副本再加载。
+                import shutil
+                import tempfile as _tf
+                fd, tmp_copy = _tf.mkstemp(suffix=".xlsx")
+                os.close(fd)
+                shutil.copyfile(file_path, tmp_copy)
+                load_path = tmp_copy
+                wb = openpyxl.load_workbook(
+                    load_path, data_only=True, read_only=bool(limits.get("read_only", True)))
+        except zipfile.BadZipFile as e:
+            raise MalformedDocumentError(
+                f"Cannot open workbook (not a valid OOXML zip): {e}",
+                file_path=file_path,
+            ) from e
+        except Exception as e:
+            # 其余打开失败（结构损坏/加密等）归一为 MalformedDocumentError
+            raise MalformedDocumentError(
+                f"Cannot open workbook: {type(e).__name__}: {e}",
+                file_path=file_path,
+            ) from e
+        finally:
+            if tmp_copy:
+                try:
+                    os.remove(tmp_copy)
+                except OSError:
+                    pass
         result = Document()
 
         try:

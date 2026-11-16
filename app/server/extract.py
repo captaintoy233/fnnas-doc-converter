@@ -14,6 +14,8 @@ import tarfile
 import zipfile
 from pathlib import Path
 
+from errors import MalformedDocumentError
+
 logger = logging.getLogger("docconverter.extract")
 
 # 归档扩展名（容器类：解压后可能含多个可转换文件）
@@ -94,8 +96,15 @@ def extract_zip(archive: Path, dest: Path, config=None) -> list:
                 target.mkdir(parents=True, exist_ok=True)
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
-            with zf.open(info) as src, open(target, "wb") as dst:
-                shutil.copyfileobj(src, dst)
+            try:
+                with zf.open(info) as src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+            except (zipfile.BadZipFile, OSError) as e:
+                # 损坏条目（截断/坏 CRC/坏 offset）：条目级降级为 MalformedDocumentError
+                raise MalformedDocumentError(
+                    "归档条目损坏，无法解压 {}: {}".format(name, e),
+                    file_path=str(archive),
+                ) from e
             out.append(str(target))
     return out
 

@@ -304,6 +304,21 @@ class LibreOfficeConverter(BaseConverter):
         if ext == '.gd':
             return self._fallback_gd(file_path)
 
+        # P1-提质 (2026-11-15): 旧格式回退判定改用嗅探结果。
+        # WPS 系 `.et/.wps` 等双扩展文件嗅探为 `.xls/.doc`，但本函数
+        # ext 取自路径后缀，无 LO 时会误落 "No fallback converter for .et"。
+        # 改为：嗅探出 zip 系（xlsx/docx）交给对应原生存换器语义不存在于此层，
+        # 这里只把「嗅探为 doc/xls/dps 的 OLE2 文件」映射到对应 fallback。
+        sniff_ext = None
+        try:
+            from sniffer import sniff_format
+            sniff_ext, _ = sniff_format(file_path)
+        except Exception:
+            sniff_ext = None
+        # 保守原则：嗅探失败时退回路径后缀
+        if sniff_ext in ('.doc', '.xls', '.dps'):
+            ext = sniff_ext
+
         # 优先尝试 LibreOffice
         if self._has_libreoffice():
             try:
