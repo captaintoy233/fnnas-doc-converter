@@ -2,7 +2,8 @@
 
 设计（成对互换去偏）：
   - 每份语料取两个版本：A=docconverter 输出（bench/out/<stem>.md），
-    B=独立朴素抽取（pdf→pymupdf / docx→python-docx / xlsx→openpyxl / et(OLE2)→xlrd）。
+    B=独立朴素抽取（pdf→pymupdf / docx→python-docx / xlsx→openpyxl / et(OLE2)→xlrd /
+      doc,wps→Word piece table / ofd→XML TextCode）。
   - 盲评：judge 不知道哪个来自哪个转换器，只看到「文本A / 文本B」。
   - 位置互换跑两轮（A/B 与 B/A），只认两轮一致的胜者，消位置偏。
   - 评分权重：内容保真 50% + 结构可读 30% + 格式干净 20%。
@@ -83,9 +84,82 @@ def _openpyxl_text(path: Path) -> str:
                 pass
 
 
+def _doc_text(path: Path) -> str:
+    """独立 .doc/.wps 文本抽取：FIB → CLX piece table → 逐片解码。
+    刻意不复用 docconverter 的 fcMin/fcMac+启发式（后者对 fComplex 文档会把
+    格式二进制数据当文本，产生大块乱码）。piece table 只取真正的正文片。"""
+    import struct
+    import olefile
+    ole = olefile.OleFileIO(str(path))
+    try:
+        wd = ole.openstream('WordDocument').read()
+        flags = struct.unpack_from('<H', wd, 0x0A)[0]
+        which = '1Table' if (flags & 0x0200) else '0Table'
+        if not ole.exists(which):
+            which = '0Table' if ole.exists('0Table') else '1Table'
+        tbl = ole.openstream(which).read()
+    finally:
+        ole.close()
+    fc_clx, lcb_clx = struct.unpack_from('<II', wd, 0x01A2)
+    clx = tbl[fc_clx:fc_clx + lcb_clx]
+    pos = 0
+    while pos < len(clx) and clx[pos] == 0x01:  # 跳过 Prc
+        cb = struct.unpack_from('<H', clx, pos + 1)[0]
+        pos += 3 + cb
+    if pos >= len(clx) or clx[pos] != 0x02:
+        raise ValueError('no Pcdt in CLX')
+    lcb = struct.unpack_from('<I', clx, pos + 1)[0]
+    plc = clx[pos + 5:pos + 5 + lcb]
+    n = (lcb - 4) // 12
+    cps = struct.unpack_from('<%dI' % (n + 1), plc, 0)
+    pcd_off = (n + 1) * 4
+    out = []
+    for i in range(n):
+        fc_raw = struct.unpack_from('<I', plc, pcd_off + i * 8 + 2)[0]
+        compressed = bool(fc_raw & 0x40000000)
+        fc = fc_raw & 0x3FFFFFFF
+        cch = cps[i + 1] - cps[i]
+        if compressed:
+            out.append(wd[fc // 2:fc // 2 + cch].decode('cp1252', errors='replace'))
+        else:
+            out.append(wd[fc:fc + cch * 2].decode('utf-16-le', errors='replace'))
+    text = ''.join(out)
+    text = text.replace('\r', '\n').replace('\x0b', '\n').replace('\x07', ' ')
+    text = re.sub(r'[\x00-\x08\x0c\x0e-\x1f]', '', text)
+    text = re.sub(r'[ \t]+\n', '\n', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+def _ofd_text(path: Path) -> str:
+    """独立 OFD 抽取：按页序拼接所有 TextCode（不做字体→标题/段落重组）。"""
+    import zipfile
+    from lxml import etree
+    NS = '{http://www.ofdspec.org/2016}'
+    z = zipfile.ZipFile(str(path))
+    pages = [n for n in z.namelist()
+             if n.lower().endswith('content.xml') and 'pages' in n.lower()]
+
+    def pnum(n):
+        m = re.search(r'Page_(\d+)', n)
+        return int(m.group(1)) if m else 0
+    pages.sort(key=pnum)
+    lines = []
+    for n in pages:
+        root = etree.fromstring(z.read(n))
+        for tc in root.iter(NS + 'TextCode'):
+            if tc.text and tc.text.strip():
+                lines.append(tc.text.strip())
+    return '\n'.join(lines)
+
+
 def naive_extract(path: Path) -> str:
     """独立朴素平文本抽取（不用 docconverter 代码），按嗅探格式分派。"""
     ext, _ = sniff_format(str(path))
+    if ext in (".doc", ".wps"):
+        return _doc_text(path)
+    if ext == ".ofd":
+        return _ofd_text(path)
     if ext == ".pdf":
         import fitz
         doc = fitz.open(str(path))
@@ -120,7 +194,10 @@ def naive_extract(path: Path) -> str:
 def _cap(text: str) -> str:
     text = text or ""
     if len(text) > CHAR_CAP:
-        return text[:CHAR_CAP] + "\n…[截断]"
+        # 首+尾取样：doc/wps 的二进制乱码集中在正文之后的尾部，
+        # 仅取头部会漏掉乱码、误判 md 更优；首尾各半才能暴露尾部污染。
+        half = CHAR_CAP // 2
+        return text[:half] + "\n…[中段省略]…\n" + text[-half:]
     return text
 
 
@@ -128,13 +205,21 @@ def _call_judge(first: str, second: str, first_label: str, second_label: str) ->
     """first/second 是两段文本；按 first_label/second_label 标注呈现。"""
     prompt = (RUBRIC + "\n\n=== 文本A ===\n" + _cap(first)
               + "\n\n=== 文本B ===\n" + _cap(second))
-    r = httpx.post(GATEWAY + "/v1/chat/completions",
-                   headers={"Authorization": "Bearer " + API_KEY},
-                   json={"model": MODEL,
-                         "messages": [{"role": "user", "content": prompt}],
-                         "max_tokens": MAX_TOKENS, "temperature": 0},
-                   timeout=180)
-    r.raise_for_status()
+    r = None
+    for attempt in range(3):
+        try:
+            r = httpx.post(GATEWAY + "/v1/chat/completions",
+                           headers={"Authorization": "Bearer " + API_KEY},
+                           json={"model": MODEL,
+                                 "messages": [{"role": "user", "content": prompt}],
+                                 "max_tokens": MAX_TOKENS, "temperature": 0},
+                           timeout=180)
+            r.raise_for_status()
+            break
+        except Exception as e:
+            if attempt == 2:
+                return {"winner": "parse_error", "reason": "call_failed:" + str(e)[:40]}
+            time.sleep(2 * (attempt + 1))
     content = r.json()["choices"][0]["message"].get("content") or ""
     m = re.search(r"\{[^{}]*\"winner\"[^{}]*\}", content, re.S)
     if not m:
@@ -190,7 +275,7 @@ def main():
     for name, path in files:
         try:
             ext, _ = sniff_format(str(path))
-            if ext in (".pdf", ".docx", ".xlsx", ".xls", ".et"):
+            if ext in (".pdf", ".docx", ".xlsx", ".xls", ".et", ".doc", ".wps", ".ofd"):
                 usable.append((name, path))
         except Exception:
             pass
@@ -210,7 +295,7 @@ def main():
         usable = picked
 
     rows = []
-    wins = {"md": 0, "naive": 0, "tie": 0, "inconsistent": 0}
+    wins = {"md": 0, "naive": 0, "tie": 0, "inconsistent": 0, "error": 0}
     # 增量：跳过已评过的文件（读现有结果），避免重复消耗推理
     judged = set()
     old_rows = []
@@ -235,7 +320,12 @@ def main():
             print("%-24s SKIP naive: %s" % (name, str(e)[:50]))
             continue
         t0 = time.time()
-        res = blind_compare(md, naive)
+        try:
+            res = blind_compare(md, naive)
+        except Exception as e:
+            res = {"winner": "error", "consistent": False,
+                   "r1": {"winner": "error", "reason": str(e)[:60]},
+                   "r2": {"winner": "error", "reason": ""}}
         dt = round(time.time() - t0, 1)
         wins[res["winner"]] = wins.get(res["winner"], 0) + 1
         rows.append([name, res["winner"], res["consistent"],
