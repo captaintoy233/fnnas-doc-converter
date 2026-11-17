@@ -9,8 +9,15 @@ FIB fcMin/fcMac 直读，再回退旧版启发式。
 - 提取的文本行映射为 Paragraph blocks
 - OLE 打开失败时抛出 MalformedDocumentError
 
+表格还原（v3）:
+- Word 二进制表格用 \\x07（cell mark）分隔单元格、\\x07\\x07（cell mark + TTP
+  row mark）分隔行。旧实现把 \\x07 当控制符删除，导致单元格拼接成连续段落。
+- 现保留 \\x07/\\r 结构标记，按行/单元重建为 Table block（垂直合并以空首列表示，
+  对齐正确）；仅清晰表格（>=2 行且 >=2 列）建表，否则降级为段落，避免误判。
+
 向后兼容:
 - convert() 方法保持原有签名和返回类型
+- _extract_text() 仍返回纯文本（供 LibreOffice 回退链复用）
 - 新增 convert_to_document() 返回 Document Model
 """
 import olefile
@@ -22,12 +29,13 @@ from . import BaseConverter
 from model.document import Document
 from model.block import Paragraph
 from model.inline import Text
+from model.table import Table, TableRow, TableCell
 from render.markdown import document_to_markdown
 from errors import MalformedDocumentError
 
 
 class WPSConverter(BaseConverter):
-    """WPS文字 → MD (OLE2 WordDocument 流 + FIB 正文定位)"""
+    """WPS文字 → MD (OLE2 WordDocument 流 + FIB 正文定位 + 表格还原)"""
 
     def supported_extensions(self) -> list:
         return ['.wps']
@@ -103,8 +111,12 @@ class WPSConverter(BaseConverter):
         text = text[start.start():] if start else text
         return text
 
-    def _extract_text(self, file_path: str) -> str:
-        """从 WPS 文件中提取纯文本"""
+    def _read_word_streams(self, file_path: str):
+        """读取 OLE2 的 WordDocument 与 Table 流，返回 (wd, tbl)。
+
+        piece table 所在的 Table 流由 FIB 0x0A bit9 选择 1Table/0Table。
+        OLE 打开/读流失败抛 MalformedDocumentError。
+        """
         try:
             ole = olefile.OleFileIO(file_path)
         except Exception as e:
@@ -114,7 +126,6 @@ class WPSConverter(BaseConverter):
             ) from e
         try:
             wd = ole.openstream('WordDocument').read()
-            # piece table 所在的 Table 流：FIB 0x0A bit9 选 1Table/0Table
             tbl = b""
             try:
                 flags = struct.unpack_from('<H', wd, 0x0A)[0]
@@ -132,14 +143,26 @@ class WPSConverter(BaseConverter):
             ) from e
         finally:
             ole.close()
+        return wd, tbl
 
-        # piece table 优先（只取真正正文片，消除尾部乱码）→ FIB 直读 → 启发式兜底
+    def _raw_text(self, wd: bytes, tbl: bytes) -> str:
+        """提取正文，保留表格结构标记 \\x07（cell mark）与 \\r（段落标记）。
+
+        piece table 优先（只取真正正文片，消除尾部乱码）→ FIB 直读 → 启发式兜底。
+        仅删除除 \\x07/\\t/\\n/\\r 外的控制符，供表格重建使用。
+        """
         text = self._extract_piece_table(wd, tbl)
         if len(text.strip()) < 4:
             text = self._extract_fib_text(wd)
         if len(text.strip()) < 4:
             text = self._extract_heuristic(wd)
+        # 保留 \x07(cell) \t(\x09) \n(\x0a) \r(\x0d)，删除其余控制符
+        return re.sub(r'[\x00-\x06\x08\x0b\x0c\x0e-\x1f]', '', text)
 
+    def _extract_text(self, file_path: str) -> str:
+        """从 WPS 文件中提取纯文本（向后兼容，供 LibreOffice 回退链复用）"""
+        wd, tbl = self._read_word_streams(file_path)
+        text = self._raw_text(wd, tbl)
         text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text)
         text = text.replace('\r\n', '\n').replace('\r', '\n')
         # 合并多余空行，压缩行间空白
@@ -147,17 +170,67 @@ class WPSConverter(BaseConverter):
         text = re.sub(r'\n{3,}', '\n\n', text)
         return text.strip()
 
+    def _parse_blocks(self, raw: str) -> list:
+        """把保留结构标记的正文解析为 Paragraph / Table blocks。
+
+        段落以 \\r（Word 段落标记）分隔；无表格标记的段再按 \\n 细分（兼容
+        以 \\n 分行的文本）。含 \\x07 的段视为表格区：按恰好 \\x07\\x07 切行
+        （保留垂直合并的空首列以对齐），单元按 \\x07 切分；不含 \\x07 的行块
+        视为表后散文。仅 >=2 行且 >=2 列建 Table，否则降级为段落。
+        """
+        blocks = []
+        for para in raw.split('\r'):
+            if '\x07' not in para:
+                for sub in para.split('\n'):
+                    sub = sub.strip()
+                    if sub:
+                        blocks.append(Paragraph(children=[Text(sub)]))
+                continue
+
+            chunks = re.split(r'\x07\x07', para)
+            rows = []
+
+            def flush():
+                if not rows:
+                    return
+                ncol = max(len(r) for r in rows)
+                if ncol >= 2 and len(rows) >= 2:
+                    trows = []
+                    for idx, r in enumerate(rows):
+                        cells = r + [''] * (ncol - len(r))
+                        tcells = [TableCell(children=[Text(c)], is_header=(idx == 0))
+                                  for c in cells]
+                        trows.append(TableRow(cells=tcells, is_header=(idx == 0)))
+                    blocks.append(Table(rows=trows))
+                else:
+                    for r in rows:
+                        s = ' '.join(c for c in r if c).strip()
+                        if s:
+                            blocks.append(Paragraph(children=[Text(s)]))
+                rows.clear()
+
+            for ch in chunks:
+                if '\x07' in ch:
+                    cells = [c.strip() for c in ch.split('\x07')]
+                    while cells and cells[-1] == '':
+                        cells.pop()
+                    if cells:
+                        rows.append(cells)
+                else:
+                    flush()
+                    p = ch.strip()
+                    if p:
+                        blocks.append(Paragraph(children=[Text(p)]))
+            flush()
+        return blocks
+
     def convert_to_document(self, file_path: str, **kwargs) -> Document:
-        """转换为统一文档模型"""
-        text = self._extract_text(file_path)
+        """转换为统一文档模型（含表格还原）"""
+        wd, tbl = self._read_word_streams(file_path)
+        raw = self._raw_text(wd, tbl)
         doc = Document()
-
-        # Split text into lines and create Paragraph blocks
-        for line in text.split('\n'):
-            line = line.strip()
-            if line:
-                doc.add_block(Paragraph(children=[Text(line)]))
-
+        for block in self._parse_blocks(raw):
+            doc.add_block(block)
         return doc
 
     def convert(self, file_path: str, **kwargs) -> str:

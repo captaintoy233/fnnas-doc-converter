@@ -163,14 +163,16 @@ class LibreOfficeConverter(BaseConverter):
     # ------------------------------------------------------------------
 
     def _fallback_doc(self, file_path: str) -> str:
-        """纯 Python .doc 文本提取。
+        """纯 Python .doc → Markdown（含表格还原）。
 
         .doc 与 .wps 同为 OLE2 WordDocument 二进制格式，复用 WPSConverter 的
         piece table 抽取（只取真正正文片，消除旧 fcMin/fcMac+启发式对 fComplex
-        文档产生的尾部二进制乱码）。OLE 打开失败抛 MalformedDocumentError。
+        文档产生的尾部二进制乱码）与表格重建（\x07 cell mark → Table block）。
+        返回完整 Markdown（而非纯文本），使 .doc 与 .wps 在回退路径上同样保留
+        表格结构。OLE 打开失败抛 MalformedDocumentError。
         """
         from .wps import WPSConverter
-        return WPSConverter()._extract_text(file_path)
+        return WPSConverter().convert(file_path)
 
     def _fallback_xls(self, file_path: str) -> str:
         """纯 Python .xls 表格提取（xlrd）"""
