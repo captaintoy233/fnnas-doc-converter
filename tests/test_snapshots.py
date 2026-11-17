@@ -90,7 +90,9 @@ class TestSnapshots:
     
     def _run_snapshot_test(self, filename: str):
         """通用快照测试逻辑"""
-        name = Path(filename).stem
+        # 用完整文件名（含扩展名）作快照名：docx/ofd/wps 三样本同 stem=test_sample，
+        # 若用 stem 会共用同一 snap.md/quality.json，后写覆盖先写，削弱逐格式回归守护。
+        name = Path(filename).name
         md = _convert_sample(filename)
         
         # 质量评估
@@ -102,6 +104,11 @@ class TestSnapshots:
         for w in quality.warnings:
             print(f"    ⚠ {w}")
         
+        # 先读旧质量基线（必须在 _save_quality_report 覆盖之前读取，
+        # 否则旧基线被当前分覆盖，回归判定 quality.score < old-5 恒为假，守护失效）
+        old_quality_path = SNAPSHOT_DIR / f"{name}.quality.json"
+        old_q = json.loads(old_quality_path.read_text(encoding="utf-8")) if old_quality_path.exists() else None
+
         # 保存质量报告
         _save_quality_report(name, quality)
         
@@ -120,16 +127,13 @@ class TestSnapshots:
             old_hash = hashlib.sha256(existing.encode()).hexdigest()[:16]
             
             if new_hash != old_hash:
-                # 内容变化时检查质量是否下降
-                old_quality_path = SNAPSHOT_DIR / f"{name}.quality.json"
-                if old_quality_path.exists():
-                    old_q = json.loads(old_quality_path.read_text())
-                    if quality.score < old_q.get("score", 0) - 5:
-                        pytest.fail(
-                            f"Quality regression for {filename}: "
-                            f"{old_q['score']:.0f} → {quality.score:.0f}\n"
-                            f"Run with --snapshot-update to accept changes."
-                        )
+                # 内容变化时检查质量是否下降（old_q 已在覆盖前读取）
+                if old_q is not None and quality.score < old_q.get("score", 0) - 5:
+                    pytest.fail(
+                        f"Quality regression for {filename}: "
+                        f"{old_q['score']:.0f} → {quality.score:.0f}\n"
+                        f"Run with --snapshot-update to accept changes."
+                    )
                 
                 # 更新快照（非回归的变化）
                 _save_snapshot(name, md)

@@ -1,0 +1,15 @@
+{
+  "score": 86.0,
+  "completeness": 60.0,
+  "structure": 100,
+  "formatting": 100,
+  "cleanliness": 100,
+  "details": {
+    "char_count": 261,
+    "line_count": 24,
+    "heading_count": 4,
+    "table_count": 4,
+    "list_item_count": 0
+  },
+  "warnings": []
+}
